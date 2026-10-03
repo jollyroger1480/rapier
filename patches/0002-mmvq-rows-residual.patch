@@ -1,0 +1,203 @@
+diff --git a/include/strata/kernels/native_mmvq.hpp b/include/strata/kernels/native_mmvq.hpp
+index 9f69dd9..9d95919 100644
+--- a/include/strata/kernels/native_mmvq.hpp
++++ b/include/strata/kernels/native_mmvq.hpp
+@@ -72,6 +72,15 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
+ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream);
+ 
++// Residual-epilogue variants: y[row] = acc + res[row] (row-resolved in the GEMV) and partials[block] receives
++// that block's sum of squared outputs, so the caller's next rms-norm needs no separate add+reduce kernel.
++// partials has ceil(n_out / 4) float slots for both formats.
++void native_q6_k_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
++                          int n_in, int n_out, void* stream);
++
++void native_q8_0_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
++                          int n_in, int n_out, void* stream);
++
+ void native_q6_k_f32(const void* weights, const float* x, void* scratch_q8_1,
+                      float* y, int n_in, int n_out, int ncols, void* stream);
+ 
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index e0a4c1b..2b3a08d 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -622,13 +622,15 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
+     return q6_q8_dot_impl(vl, vh, u, w->scales + scale_offset, w->d, d8);
+ }
+ 
+-// Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.
+-template<bool SmallK>
++// Q6_K generic MMVQ: QK=256, QI=32, VDR=1, four blocks per iteration.  Rows-per-block is a template knob:
++// a single-row block gives each lane only 4 kbx iterations of outstanding loads, which measures ~551 GB/s
++// when the weights stream from DRAM (lm_head, 834 MB); wider blocks deepen the memory pipeline.
++template<int Rows>
+ __launch_bounds__(WARPS * WARP, 1)
+ __global__ void native_q6_k_mmvq_kernel(const Q6KBlock* __restrict__ w,
+                                         const Q81Block* __restrict__ x,
+                                         float* __restrict__ y, int n_in, int n_out) {
+-    constexpr int ROWS = SmallK ? WARPS : 1;
++    constexpr int ROWS = Rows;
+     constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
+     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+     const int row0 = ROWS * int(blockIdx.x);
+@@ -1163,6 +1165,135 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
+     launch_check();
+ }
+ 
++// ============================ decode residual epilogue (qwythos) ============================
++//
++// The 4096-row GEMVs whose output is a residual add (ssm_out / attn_wo / ffn_down) otherwise need a separate
++// add+sum-of-squares kernel per call.  These variants fold both into the GEMV: y[row] = acc + res[row] and
++// partials[block] = sum of squared outputs of this block's rows.  Deterministic: every block owns fixed rows
++// and writes its own partial slot.  Sum order differs from the standalone add kernel only in grouping, which
++// is below fp32 reduction noise.
++
++__global__ void native_q6_k_mmvq_res_kernel(const Q6KBlock* __restrict__ w, const Q81Block* __restrict__ x,
++                                            float* __restrict__ y, const float* __restrict__ res,
++                                            float* __restrict__ partials, int n_in, int n_out) {
++    constexpr int ROWS = 4;
++    constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
++    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
++    const int row0 = ROWS * int(blockIdx.x);
++    const int blocks_per_row = n_in / 256;
++    float tmp[ROWS] = {};
++    for (int kbx = tid / 32; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
++        const int kby = kbx * 8;
++        const int kqs = tid % 32;
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            if (row0 + i < n_out) {
++                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
++                tmp[i] += q6_q8_dot(w + block, x + kby, kqs);
++            }
++        }
++    }
++    __shared__ float partial[WARPS - 1][ROWS][WARP];
++    if (threadIdx.y > 0) {
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) return;
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++#pragma unroll
++        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
++        tmp[i] = warp_sum(tmp[i]);
++    }
++    if (threadIdx.x == 0) {
++        float p = 0.0f;
++        for (int i = 0; i < ROWS; ++i) {
++            if (row0 + i < n_out) {
++                const float v = tmp[i] + res[row0 + i];
++                y[row0 + i] = v;
++                p += v * v;
++            }
++        }
++        partials[blockIdx.x] = p;
++    }
++}
++
++template<typename Weight, int Qi>
++__global__ void native_small_mmvq_res_kernel(const Weight* __restrict__ w, const Q81Block* __restrict__ x,
++                                             float* __restrict__ y, const float* __restrict__ res,
++                                             float* __restrict__ partials, int n_in, int n_out) {
++    constexpr int ROWS = 4;
++    constexpr int BLOCKS_PER_ITER = 2 * WARPS * WARP / Qi;
++    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
++    const int row0 = ROWS * int(blockIdx.x);
++    const int blocks_per_row = n_in / 32;
++    float tmp[ROWS] = {};
++    for (int kbx = tid / (Qi / 2); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
++        const int kqs = 2 * (tid % (Qi / 2));
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) {
++            if (row0 + i < n_out) {
++                tmp[i] += small_q8_dot(w + std::size_t(row0 + i) * blocks_per_row + kbx, x + kbx, kqs);
++            }
++        }
++    }
++    __shared__ float partial[WARPS - 1][ROWS][WARP];
++    if (threadIdx.y > 0) {
++#pragma unroll
++        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
++    }
++    __syncthreads();
++    if (threadIdx.y > 0) return;
++#pragma unroll
++    for (int i = 0; i < ROWS; ++i) {
++#pragma unroll
++        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
++        tmp[i] = warp_sum(tmp[i]);
++    }
++    if (threadIdx.x == 0) {
++        float p = 0.0f;
++        for (int i = 0; i < ROWS; ++i) {
++            if (row0 + i < n_out) {
++                const float v = tmp[i] + res[row0 + i];
++                y[row0 + i] = v;
++                p += v * v;
++            }
++        }
++        partials[blockIdx.x] = p;
++    }
++}
++
++void native_q6_k_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
++                          int n_in, int n_out, void* stream) {
++    validate_shape(n_in, 1, QK);
++    validate_pointer(weights);
++    validate_pointer(x_q8_1);
++    validate_pointer(y);
++    validate_pointer(res);
++    validate_pointer(partials);
++    validate_stream(stream);
++    const unsigned blocks = unsigned((std::size_t(n_out) + 3) / 4);
++    native_q6_k_mmvq_res_kernel<<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
++        static_cast<const Q6KBlock*>(weights), static_cast<const Q81Block*>(x_q8_1), y, res, partials, n_in, n_out);
++    launch_check();
++}
++
++void native_q8_0_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
++                          int n_in, int n_out, void* stream) {
++    validate_shape(n_in, 1, 32);
++    validate_pointer(weights);
++    validate_pointer(x_q8_1);
++    validate_pointer(y);
++    validate_pointer(res);
++    validate_pointer(partials);
++    validate_stream(stream);
++    const unsigned blocks = unsigned((std::size_t(n_out) + 3) / 4);
++    native_small_mmvq_res_kernel<Q80Block, 8><<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
++        static_cast<const Q80Block*>(weights), static_cast<const Q81Block*>(x_q8_1), y, res, partials, n_in, n_out);
++    launch_check();
++}
++
+ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+                       int n_in, int n_out, int ncols, void* stream) {
+     validate_shape(n_in, ncols, QK);
+@@ -1376,11 +1507,18 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+     const auto* x = static_cast<const Q81Block*>(x_q8_1);
+     const auto s = static_cast<cudaStream_t>(stream);
+     const dim3 threads(WARP, WARPS);
+-    if (n_in / 256 < WARPS * WARP / 32) {
+-        const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
+-        native_q6_k_mmvq_kernel<true><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out);
+-    } else {
+-        native_q6_k_mmvq_kernel<false><<<unsigned(n_out), threads, 0, s>>>(w, x, y, n_in, n_out);
++    // Rows-per-block sweep knob (default 4).  Bit-identical across values: the per-row accumulation and the
++    // shared reduction order do not depend on Rows.
++    static const int rows = [] {
++        const char* v = std::getenv("QWYTHOS_Q6ROWS");
++        return v ? std::atoi(v) : 4;
++    }();
++    const unsigned blocks = unsigned((std::size_t(n_out) + rows - 1) / rows);
++    switch (rows) {
++        case 1: native_q6_k_mmvq_kernel<1><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
++        case 2: native_q6_k_mmvq_kernel<2><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
++        case 8: native_q6_k_mmvq_kernel<8><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
++        default: native_q6_k_mmvq_kernel<4><<<blocks, threads, 0, s>>>(w, x, y, n_in, n_out); break;
+     }
+     launch_check();
+ }

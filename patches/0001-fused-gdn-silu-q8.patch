@@ -1,0 +1,200 @@
+diff --git a/include/strata/kernels/fused_gdn.hpp b/include/strata/kernels/fused_gdn.hpp
+index 0cf7c66..606b032 100644
+--- a/include/strata/kernels/fused_gdn.hpp
++++ b/include/strata/kernels/fused_gdn.hpp
+@@ -32,4 +32,16 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
+                          const float* beta, const float* z, const float* gamma, float eps, float* y, int h_k, int h_v,
+                          void* stream);
+ 
++/// qwen35 variant of `fused_gdn_step_norm`: y = rmsnorm(o) * gamma * silu(z).  When `q8` is non-null it also
++/// receives the Q8_1 blocks (36 B: half2 d/sum, then 32 int8 codes) of y, one per 32 columns, quantized with the
++/// same warp reductions as `native_quantize_q8_1` - so the ssm_out GEMV can consume it without a second pass.
++void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
++                              const float* beta, const float* z, const float* gamma, float eps, float* y,
++                              void* q8, int h_k, int h_v, void* stream);
++
++/// `fused_gdn_conv_l2` plus the q-only output scale the qwen35 trunk applies after the L2 norm: heads
++/// `[0, q_heads)` are multiplied by `q_scale` (1/sqrt(S)) after normalization, k and v are untouched.
++void fused_gdn_conv_l2_qk(float* history, const float* qkv, const float* conv_w, float* h, int channels,
++                          int qk_heads, int q_heads, float q_scale, float eps, void* stream);
++
+ }  // namespace strata::kernels
+diff --git a/src/kernels/cuda/fused_gdn.cu b/src/kernels/cuda/fused_gdn.cu
+index ef2e778..99ae552 100644
+--- a/src/kernels/cuda/fused_gdn.cu
++++ b/src/kernels/cuda/fused_gdn.cu
+@@ -1,6 +1,7 @@
+ // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
+ #include "strata/kernels/fused_gdn.hpp"
+ 
++#include <cuda_fp16.h>
+ #include <cuda_runtime.h>
+ 
+ #include <cstdio>
+@@ -13,13 +14,34 @@ constexpr int S = 128;          // state size (rows = cols = 128)
+ constexpr int RG = 4;           // row groups
+ constexpr int RPG = S / RG;     // 32 rows per thread
+ 
++__device__ __forceinline__ float warp_max32(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
++    return v;
++}
++
++__device__ __forceinline__ float warp_sum32(float v) {
++#pragma unroll
++    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
++    return v;
++}
++
++// Same 36-byte block layout native_quantize_q8_1 produces: half2 (d, sum), then 32 int8 codes.
++struct Q8OutBlock {
++    uint32_t ds;
++    int8_t qs[32];
++};
++static_assert(sizeof(Q8OutBlock) == 36);
++
++template <bool Silu, bool WithQ8>
+ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict__ state, const float* __restrict__ q,
+                                                                const float* __restrict__ k, const float* __restrict__ v,
+                                                                const float* __restrict__ gate,
+                                                                const float* __restrict__ beta,
+                                                                const float* __restrict__ z,
+                                                                const float* __restrict__ gamma, float eps,
+-                                                               float* __restrict__ y, int h_k, int h_v) {
++                                                               float* __restrict__ y, uint8_t* __restrict__ q8,
++                                                               int h_k, int h_v) {
+     __shared__ float sk[S], sq[S];
+     __shared__ float red[RG][S];
+     __shared__ float wsum[S * RG / 32];
+@@ -35,7 +57,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
+ #pragma unroll
+     for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+     __syncthreads();
+-    const float g = __expf(gate[head]);
++    const float g = expf(gate[head]);
+     float kv = 0.0f;
+ #pragma unroll
+     for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+@@ -66,7 +88,23 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
+         const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+         const float scale = rsqrtf(ss / (float) S + eps);
+         const float zz = z[head * S + col];
+-        y[head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
++        const float gate_z = Silu ? zz / (1.0f + expf(-zz)) : 1.0f / (1.0f + expf(-zz));
++        const float yv = oc * scale * gamma[col] * gate_z;
++        y[head * S + col] = yv;
++        if (WithQ8) {
++            // rg==0 threads are cols 0..127: warp w holds the 32 consecutive cols of Q8 block head*4+w,
++            // so the amax/sum reductions match native_quantize_q8_1's per-warp xor trees exactly.
++            const float amax = warp_max32(fabsf(yv));
++            const float sum = warp_sum32(yv);
++            const float d = amax / 127.0f;
++            const int8_t qc = amax == 0.0f ? 0 : (int8_t) roundf(yv / d);
++            Q8OutBlock* blk = reinterpret_cast<Q8OutBlock*>(q8) + (size_t) head * 4 + (col >> 5);
++            blk->qs[col & 31] = qc;
++            if ((col & 31) == 0) {
++                const __half2 ds = __floats2half2_rn(d, sum);
++                blk->ds = *reinterpret_cast<const uint32_t*>(&ds);
++            }
++        }
+     }
+ }
+ 
+@@ -80,7 +118,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
+     hist[c * 3] = v1;
+     hist[c * 3 + 1] = v2;
+     hist[c * 3 + 2] = x;
+-    float y = sum / (1.0f + __expf(-sum));
++    float y = sum / (1.0f + expf(-sum));
+     if ((int) blockIdx.x < qk_heads) {
+         float sq = y * y;
+         for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+@@ -92,6 +130,30 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
+     h[c] = y;
+ }
+ 
++// qwen35: q heads additionally take the trunk's 1/sqrt(S) scale AFTER the L2 norm, as scale_inplace did.
++__global__ void __launch_bounds__(S) gdn_conv_l2_qk_kernel(float* __restrict__ hist, const float* __restrict__ qkv,
++                                                           const float* __restrict__ w, float* __restrict__ h,
++                                                           int qk_heads, int q_heads, float q_scale, float eps) {
++    __shared__ float part[S / 32];
++    const int c = blockIdx.x * S + threadIdx.x;
++    const float v0 = hist[c * 3], v1 = hist[c * 3 + 1], v2 = hist[c * 3 + 2], x = qkv[c];
++    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
++    hist[c * 3] = v1;
++    hist[c * 3 + 1] = v2;
++    hist[c * 3 + 2] = x;
++    float y = sum / (1.0f + expf(-sum));
++    if ((int) blockIdx.x < qk_heads) {
++        float sq = y * y;
++        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
++        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
++        __syncthreads();
++        const float ss = part[0] + part[1] + part[2] + part[3];
++        y *= rsqrtf(ss + eps);
++        if ((int) blockIdx.x < q_heads) y *= q_scale;
++    }
++    h[c] = y;
++}
++
+ __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
+                                                      const uint16_t* __restrict__ wb, const float* __restrict__ dt,
+                                                      const float* __restrict__ ssm_a, float* __restrict__ gate,
+@@ -135,6 +197,19 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
+     if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); std::exit(1); }
+ }
+ 
++void fused_gdn_conv_l2_qk(float* history, const float* qkv, const float* conv_w, float* h, int channels,
++                          int qk_heads, int q_heads, float q_scale, float eps, void* stream) {
++    if (!history || !qkv || !conv_w || !h || channels % S != 0 || qk_heads < 0 || q_heads < 0 ||
++        q_heads > qk_heads || qk_heads > channels / S) {
++        std::fprintf(stderr, "fused_gdn_conv_l2_qk: invalid arguments\n");
++        std::exit(1);
++    }
++    gdn_conv_l2_qk_kernel<<<(unsigned) (channels / S), S, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h,
++                                                                                      qk_heads, q_heads, q_scale, eps);
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2_qk: %s\n", cudaGetErrorString(e)); std::exit(1); }
++}
++
+ void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                   float* gate, float* beta, int n_embd, int h_v, void* stream) {
+     if (!x || !w_alpha || !w_beta || !dt || !ssm_a || !gate || !beta || n_embd % 8 != 0 || h_v <= 0) {
+@@ -154,8 +229,8 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
+         std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
+         std::exit(1);
+     }
+-    gdn_step_norm_kernel<<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, z,
+-                                                                                   gamma, eps, y, h_k, h_v);
++    gdn_step_norm_kernel<false, false><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
++        state, q, k, v, gate, beta, z, gamma, eps, y, nullptr, h_k, h_v);
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) {
+         std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
+@@ -163,4 +238,25 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
+     }
+ }
+ 
++void fused_gdn_step_norm_silu(float* state, const float* q, const float* k, const float* v, const float* gate,
++                              const float* beta, const float* z, const float* gamma, float eps, float* y,
++                              void* q8, int h_k, int h_v, void* stream) {
++    if (!state || !q || !k || !v || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v <= 0 || h_v % h_k) {
++        std::fprintf(stderr, "fused_gdn_step_norm_silu: invalid arguments\n");
++        std::exit(1);
++    }
++    if (q8 != nullptr) {
++        gdn_step_norm_kernel<true, true><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
++            state, q, k, v, gate, beta, z, gamma, eps, y, (uint8_t*) q8, h_k, h_v);
++    } else {
++        gdn_step_norm_kernel<true, false><<<(unsigned) h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
++            state, q, k, v, gate, beta, z, gamma, eps, y, nullptr, h_k, h_v);
++    }
++    const cudaError_t e = cudaGetLastError();
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "fused_gdn_step_norm_silu: %s\n", cudaGetErrorString(e));
++        std::exit(1);
++    }
++}
++
+ }  // namespace strata::kernels
