@@ -39,11 +39,40 @@ constexpr int kRot = 64;
 constexpr int kMaxCtx = 16384;
 // set at parse time (--serve); silences stdout chatter that would corrupt the JSON protocol
 static bool g_serve_mode = false;
+
 constexpr float kInvSqrtS = 0.0883883476f; // 1/sqrt(128)
 constexpr float kAttnScale = 0.0625f;      // 1/sqrt(256)
 
 #define CK(e) do { cudaError_t _e = (e); if (_e != cudaSuccess) { \
     std::fprintf(stderr, "%s: %s\n", #e, cudaGetErrorString(_e)); std::exit(1); } } while (0)
+
+// GPU argmax for the serve path: packs (monotonic-float-bits, n-1-index) and atomicMax-es,
+// so the lowest index wins exact-tie comparisons exactly like the host's strictly-greater scan.
+__global__ void argmax_kernel(const float* __restrict__ l, int n, unsigned long long* __restrict__ out) {
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    float best = -INFINITY;
+    int bi = -1;
+    for (int i = i0; i < n; i += stride) {
+        if (l[i] > best) { best = l[i]; bi = i; }
+    }
+    if (bi >= 0) {
+        unsigned int vb = __float_as_uint(best);
+        vb ^= (vb >> 31) ? 0xFFFFFFFFu : 0x80000000u;   // monotonic transform
+        unsigned long long pack = ((unsigned long long) vb << 32) | (unsigned int) (n - 1 - bi);
+        atomicMax(out, pack);
+    }
+}
+static unsigned long long* g_amax = nullptr;
+// returns argmax id of dev[off .. off+n); n must be the full row (index tie-break uses n)
+static int serve_argmax_dev(const float* dev, int n, cudaStream_t sp) {
+    if (!g_amax) CK(cudaMalloc(&g_amax, 8));
+    CK(cudaMemsetAsync(g_amax, 0, 8, sp));
+    argmax_kernel<<<512, 256, 0, sp>>>(dev, n, g_amax);
+    unsigned long long pack = 0;
+    CK(cudaMemcpy(&pack, g_amax, 8, cudaMemcpyDeviceToHost));
+    return (int) (n - 1 - (int) (pack & 0xFFFFFFFFu));
+}
 
 size_t row_bytes(int type, int n_in) {
     if (type == 0) return (size_t) n_in * 4;
@@ -1121,6 +1150,10 @@ int draft_predict(Engine& e, int next_tok, int pos, const float* h_prev, const f
     ck_launch("draft shnorm");
     if (!with_head) return -1;  // cache-fill step: the KV slot is what matters, not the prediction
     mm_q(e.out_w.type, e.out_w.a, e.scratch_p, e.d_logits, e.out_w.n_in, e.out_w.n_out, e.sp);
+    if (g_serve_mode) {
+        CK(cudaStreamSynchronize(e.sp));
+        return serve_argmax_dev(e.d_logits, kVocab, e.sp);
+    }
     CK(cudaMemcpyAsync(e.hlogits, e.d_logits, (size_t) kVocab * 4, cudaMemcpyDeviceToHost, e.sp));
     CK(cudaStreamSynchronize(e.sp));
     int best = 0;
@@ -1318,7 +1351,8 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
         std::printf("\n");
         std::fflush(stdout);
     }
-    CK(cudaMemcpyAsync(e.hlogits2, e.logits2, (size_t) 2 * kVocab * 4, cudaMemcpyDeviceToHost, e.sp));
+    if (!g_serve_mode)  // CLI samples on host; serve mode argmaxes on device
+        CK(cudaMemcpyAsync(e.hlogits2, e.logits2, (size_t) 2 * kVocab * 4, cudaMemcpyDeviceToHost, e.sp));
     CK(cudaStreamSynchronize(e.sp));
 }
 
@@ -1828,6 +1862,7 @@ void load_model(Engine& e, const strata::GgufFile& file) {
 // Greedy (mtp=true) reproduces the CLI MTP stream bit-for-bit. The server owns tokenization
 // and sampling; the engine owns state and speed.
 
+
 static void json_escape_out(const char* key, const std::vector<std::pair<int, float>>& v) {
     std::printf("\"%s\":[", key);
     for (size_t i = 0; i < v.size(); ++i) {
@@ -1976,48 +2011,17 @@ static void serve_loop(Engine& e) {
             int cand = draft_predict(e, cur, pos, e.h_save, h_part, true);
             while (emitted < gen) {
                 launch_token_verify(e, cur, cand, pos);
-                int c0 = serve_argmax(e.hlogits2);
-                int c1 = serve_argmax(e.hlogits2 + kVocab);
+                int c0 = serve_argmax_dev(e.logits2, kVocab, e.sp);
+                int c1 = serve_argmax_dev(e.logits2 + kVocab, kVocab, e.sp);
                 {
-                    std::vector<std::pair<int, float>> top;
-                    const float* l0 = e.hlogits2;
-                    top.reserve(40);
-                    for (int i = 0; i < kVocab; ++i) {
-                        if ((int) top.size() < 40) {
-                            top.push_back({i, l0[i]});
-                            if ((int) top.size() == 40) std::sort(top.begin(), top.end(),
-                                                                 [](auto& a, auto& b) { return a.second > b.second; });
-                        } else if (l0[i] > top.back().second) {
-                            top.back() = {i, l0[i]};
-                            for (size_t j = top.size() - 1; j > 0 && top[j].second > top[j - 1].second; --j)
-                                std::swap(top[j], top[j - 1]);
-                        }
-                    }
-                    std::printf("{\"id\":%d,", c0);
-                    json_escape_out("top", top);
-                    std::printf("}\n");
+                    // serve mode skips the 2 MB logits D2H: greedy needs no top list
+                    std::printf("{\"id\":%d,\"top\":[]}\n", c0);
                     std::fflush(stdout);
                 }
                 ++emitted;
                 if (c0 == cand) {
                     if (emitted < gen) {
-                        std::vector<std::pair<int, float>> top1;
-                        const float* l1 = e.hlogits2 + kVocab;
-                        top1.reserve(40);
-                        for (int i = 0; i < kVocab; ++i) {
-                            if ((int) top1.size() < 40) {
-                                top1.push_back({i, l1[i]});
-                                if ((int) top1.size() == 40) std::sort(top1.begin(), top1.end(),
-                                                                       [](auto& a, auto& b) { return a.second > b.second; });
-                            } else if (l1[i] > top1.back().second) {
-                                top1.back() = {i, l1[i]};
-                                for (size_t j = top1.size() - 1; j > 0 && top1[j].second > top1[j - 1].second; --j)
-                                    std::swap(top1[j], top1[j - 1]);
-                            }
-                        }
-                        std::printf("{\"id\":%d,", c1);
-                        json_escape_out("top", top1);
-                        std::printf("}\n");
+                        std::printf("{\"id\":%d,\"top\":[]}\n", c1);
                         std::fflush(stdout);
                         ++emitted;
                         cur = c1;

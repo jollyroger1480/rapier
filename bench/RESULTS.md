@@ -113,3 +113,17 @@ stage dumps), QWYTHOS_MTPTRACE, QWYTHOS_NOACCEPT, QWYTHOS_VSKIP1, QWYTHOS_GEMV1C
 /data/projects hit a filesystem quota (363 GB of MV projects) and ENOSPC-truncated the
 source mid-write; the tree was recovered from ZCode's workspace_file_before_change
 snapshots and moved to /data/hermes/Strata (/data/projects/Strata is a symlink).
+
+## Addendum 3: real-life serving + GPU argmax (2026-10-03)
+
+- `--serve` mode: JSON-lines on stdin (reset/run, 16K ctx, top-40 logits, greedy-MTP
+  bit-exact streams). `server/rapier_server.py`: OpenAI-compatible chat on :8084
+  (Qwen tokenizer extracted from the GGUF — ground-truth verified — ChatML, temp/top-p
+  sampling, incremental conversation session with auto-reset).
+- GPU argmax kernel (monotonic-float-bits atomicMax, lowest-index tie-break matching the
+  host scan) replaces the per-token 1 MB logits D2H + host scans on the serve path.
+- Served through the full HTTP stack: 50.7 → **60.8 tok/s** (greedy-MTP, EOS at 66 tokens).
+- Test suite (`tests/test_rapier_serve.py`): tokenizer ground-truth, 40-token engine stream
+  bit-exact, server round-trip. All green.
+- Wiring shipped: hermes-rapier.service (:8084, conflicts with the other two brains),
+  panel switches in service-control + hermes-control, Hermes provider + /fast alias.
