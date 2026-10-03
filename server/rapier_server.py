@@ -79,10 +79,86 @@ def engine_reset():
     primed = False
 
 
+def render_tools(tools):
+    """Qwen official chat-template tool block (must match training format exactly)."""
+    lines = ["# Tools", "",
+             "You may call one or more functions to assist with the user query.",
+             "", "You are provided with function signatures within <tools></tools> XML tags:",
+             "<tools>"]
+    for t in tools:
+        lines.append(json.dumps(t, ensure_ascii=False, separators=(",", ":")))
+    lines += ["</tools>", "",
+              "For each function call, return a json object with function name and arguments within ",
+              "<tool_call>", "</tool_call>", "XML tags:",
+              "<tool_call>", "{\"name\": <function-name>, \"arguments\": <args-json-object>}", "</tool_call>",
+              "###", ""]
+    return "\n".join(lines)
+
+
+import re as _re
+_TOOL_CALL_RE = _re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", _re.S)
+
+
+def parse_tool_calls(text):
+    """Extract <tool_call>{...}</tool_call> blocks -> OpenAI tool_calls list (+stripped content)."""
+    calls = []
+    def _mk(m):
+        try:
+            obj = json.loads(m.group(1))
+            name = obj.get("name")
+            args = obj.get("arguments", {})
+            if isinstance(args, str):
+                args = json.loads(args)
+            if name:
+                calls.append({"id": "call_" + str(abs(hash(text)) % 10 ** 10),
+                              "type": "function",
+                              "function": {"name": name,
+                                           "arguments": json.dumps(args, separators=(",", ":"))}})
+        except Exception:
+            pass
+        return ""
+    stripped = _TOOL_CALL_RE.sub(_mk, text).strip()
+    return calls, stripped
+
+
 def chat_template(messages):
+    messages = list(messages)
+    tools = None
+    if messages and isinstance(messages[0].get("content"), dict):
+        pass  # defensive: OpenAI never sends dict content here
+    # tool definitions ride as an extra system block on the FIRST request of a session
+    if "_rapier_tools" in (messages[0] if messages else {}):
+        tools = messages[0]["_rapier_tools"]
+        messages = [dict(m) for m in messages]
+        messages[0].pop("_rapier_tools")
     out = ""
     for m in messages:
-        out += f"<|im_start|>{m.get('role','user')}\n{m.get('content','')}<|im_end|>\n"
+        role = m.get("role", "user")
+        if role == "tool":
+            # OpenAI tool result -> Qwen's <tool_response> wrapper inside a user turn
+            out += f"<|im_start|>user\n<tool_response>\n{m.get('content','')}\n</tool_response><|im_end|>\n"
+        elif role == "assistant" and m.get("tool_calls"):
+            # assistant tool-call turn: content + each call in Qwen's <tool_call> form
+            parts = []
+            if m.get("content"):
+                parts.append(m["content"])
+            for c in m["tool_calls"]:
+                fn = c.get("function", {})
+                parts.append("<tool_call>\n" + json.dumps(
+                    {"name": fn.get("name"), "arguments": json.loads(fn.get("arguments") or "{}")},
+                    separators=(",", ":")) + "\n</tool_call>")
+            out += "<|im_start|>assistant\n" + "\n".join(parts) + "<|im_end|>\n"
+        else:
+            content = m.get("content") or ""
+            out += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+    if tools:
+        block = render_tools(tools)
+        if out.startswith("<|im_start|>system\n"):
+            end = out.index("<|im_end|>")
+            merged = out[:end] + "\n\n" + block + out[end:]
+            out = merged
+        else:
+            out = "<|im_start|>system\n" + block + "<|im_end|>\n" + out
     out += "<|im_start|>assistant\n"
     return out
 
@@ -114,6 +190,7 @@ def sample(top, temperature, top_p, rng):
 
 
 def generate(messages, max_tokens, temperature, top_p):
+    """Returns (text, raw_text) - raw includes any <tool_call> blocks."""
     global hist, primed
     engine_start()
     ids = _tk.encode(chat_template(messages)).ids
@@ -135,12 +212,17 @@ def generate(messages, max_tokens, temperature, top_p):
     out_ids, out_text = [], []
     import random
     rng = random.Random()
+    eos_hit = False
     while True:
         line = engine_recv()
         if line.get("done"):
+            # ALWAYS drain to done: an early return here leaves stale lines in the pipe and
+            # every later request reads the previous response's leftovers (off-by-one-request).
             hist = ids + out_ids
             primed = True
             break
+        if eos_hit:
+            continue  # engine stops itself after eos; ignore anything until done
         if "id" not in line:
             raise RuntimeError(f"engine line missing id: {line}")
         tid = line["id"]
@@ -148,10 +230,12 @@ def generate(messages, max_tokens, temperature, top_p):
         if not greedy and tid != EOS_ID and "top" in line and line["top"]:
             tid = sample(line["top"], temperature, top_p, rng)
         if tid == EOS_ID:
-            break
+            eos_hit = True
+            continue
         piece = _tk.decode([tid])
         out_text.append(piece)
-    return out_text
+    full = "".join(out_text)
+    return full, full
 
 
 
@@ -196,19 +280,27 @@ class Handler(BaseHTTPRequestHandler):
         temperature = float(body.get("temperature", 0.6))
         top_p = float(body.get("top_p", 0.95))
         t0 = time.time()
+        tools = body.get("tools") or None
+        if tools:
+            messages = [dict(m) for m in messages]
+            if messages:
+                messages[0]["_rapier_tools"] = tools
         try:
             with eng_lock:
-                pieces = generate(messages, max_tokens, temperature, top_p)
+                raw, _ = generate(messages, max_tokens, temperature, top_p)
         except Exception as e:
             self._json(500, {"error": str(e)})
             return
-        text = "".join(pieces)
-        n_gen = len(pieces)
+        calls, text = parse_tool_calls(raw) if tools else ([], raw)
+        n_gen = len(raw) // 4 or 1
         dt = time.time() - t0
         self._json(200, {
             "id": "rapier", "object": "chat.completion", "model": "rapier",
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": text}}],
+            "choices": [{"index": 0,
+                         "finish_reason": "tool_calls" if calls else "stop",
+                         "message": ({"role": "assistant", "content": text,
+                                      "tool_calls": calls} if calls
+                                     else {"role": "assistant", "content": text})}],
             "usage": {"prompt_tokens": 0, "completion_tokens": n_gen,
                       "total_tokens": n_gen},
             "timings": {"generation_ms": round(dt * 1000), "tok_s": round(n_gen / dt, 2) if dt else 0},

@@ -127,3 +127,16 @@ snapshots and moved to /data/hermes/Strata (/data/projects/Strata is a symlink).
   bit-exact, server round-trip. All green.
 - Wiring shipped: hermes-rapier.service (:8084, conflicts with the other two brains),
   panel switches in service-control + hermes-control, Hermes provider + /fast alias.
+
+## Addendum 4: tool calling (2026-10-03)
+
+OpenAI `tools` now works end-to-end: definitions render in the official Qwen chat-template
+format inside the system message, assistant `<tool_call>` output parses back to OpenAI
+`tool_calls`, tool results map to `<tool_response>` user turns, and multi-turn assistant
+tool-call messages render back correctly. Verified live: get_weather single call, full
+loop (call -> result -> "sunny, 24°C, SE 12 km/h" answer), cross-conversation sanity.
+
+The bug that ate the afternoon: `generate()` returned on EOS without draining the engine's
+`{"done":true}` line, leaving stale lines in the pipe - every subsequent request read the
+previous response's leftovers (one-request-off hallucinations, misattributed 500s).
+Fix: always drain to done. Lesson: a 1 ms "generation" is a protocol desync, not a speedup.
