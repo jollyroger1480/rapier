@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <iostream>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -35,7 +36,9 @@ constexpr int kHd = 256;
 constexpr int kHeads = 16;
 constexpr int kKv = 4;
 constexpr int kRot = 64;
-constexpr int kMaxCtx = 2048;
+constexpr int kMaxCtx = 16384;
+// set at parse time (--serve); silences stdout chatter that would corrupt the JSON protocol
+static bool g_serve_mode = false;
 constexpr float kInvSqrtS = 0.0883883476f; // 1/sqrt(128)
 constexpr float kAttnScale = 0.0625f;      // 1/sqrt(256)
 
@@ -1466,8 +1469,10 @@ void capture_graph(Engine& e) {
     CK(cudaStreamEndCapture(e.sp, &captured));
     CK(cudaGraphInstantiate(&e.graph, captured, 0ull));
     CK(cudaGraphDestroy(captured));
-    std::printf("graph 1\n");
-    std::fflush(stdout);
+    if (!g_serve_mode) {
+        std::printf("graph 1\n");
+        std::fflush(stdout);
+    }
 }
 
 int forward_token(Engine& e, int token, int pos) {
@@ -1626,7 +1631,7 @@ void alloc_primary(Engine& e) {
         CK(hipDeviceCanAccessPeer(&can, e.primary, e.secondary));
         int can2 = 0;
         CK(hipDeviceCanAccessPeer(&can2, e.secondary, e.primary));
-        std::printf("peer access primary->secondary %d secondary->primary %d\n", can, can2);
+        if (!g_serve_mode) std::printf("peer access primary->secondary %d secondary->primary %d\n", can, can2);
         if (can && can2) {
             CK(cudaSetDevice(e.primary));
             hipError_t pe = hipDeviceEnablePeerAccess(e.secondary, 0);
@@ -1650,7 +1655,7 @@ void alloc_tail(Engine& e) {
     CK(cudaSetDevice(e.secondary));
     CK(cudaMalloc(&e.y_s, (size_t) e.max_tail * 4));
     CK(cudaSetDevice(e.primary));
-    std::printf("split tail rows %d peer %d\n", e.max_tail, e.peer ? 1 : 0);
+    if (!g_serve_mode) std::printf("split tail rows %d peer %d\n", e.max_tail, e.peer ? 1 : 0);
 }
 
 void load_model(Engine& e, const strata::GgufFile& file) {
@@ -1675,7 +1680,7 @@ void load_model(Engine& e, const strata::GgufFile& file) {
     e.rope.attn_factor = 1;
     e.rope.beta_fast = 32;
     e.rope.beta_slow = 1;
-    std::printf("yarn factor %.3f base %.3g orig %.0f eps %.3g\n",
+    if (!g_serve_mode) std::printf("yarn factor %.3f base %.3g orig %.0f eps %.3g\n",
                 e.rope.factor, e.rope.freq_base, e.rope.orig_ctx, e.eps);
 
     Tensor emb = take(file, "token_embd.weight");
@@ -1762,7 +1767,7 @@ void load_model(Engine& e, const strata::GgufFile& file) {
             L.cat_ab = try_cat2(e, L.ab, L.beta_w, L.alpha_w);
             L.cat_upgate = try_cat2(e, L.upgate, L.up, L.gate);
         }
-        if ((il % 8) == 7) std::printf("uploaded through layer %d\n", il);
+        if ((il % 8) == 7) if (!g_serve_mode) std::printf("uploaded through layer %d\n", il);
         std::fflush(stdout);
     }
     // blk.32: the MTP draft layer (attention type) plus the nextn glue
@@ -1812,9 +1817,246 @@ void load_model(Engine& e, const strata::GgufFile& file) {
 
 }  // namespace
 
+
+// ============================ --serve: stdin JSON-lines serving mode ============================
+//
+// One JSON object per line on stdin, one line out per response, on stdout:
+//   {"op":"reset"}                              -> wipe GDN/conv/KV/draft state, pos=0
+//   {"op":"run","tokens":[..],"gen":N,"mtp":B,"topk":K}  -> ingest tokens, generate N
+//     emits one line per generated token: {"id":I,"top":[[id,logit],..K]}
+//     and a final line: {"done":true,"pos":P}
+// Greedy (mtp=true) reproduces the CLI MTP stream bit-for-bit. The server owns tokenization
+// and sampling; the engine owns state and speed.
+
+static void json_escape_out(const char* key, const std::vector<std::pair<int, float>>& v) {
+    std::printf("\"%s\":[", key);
+    for (size_t i = 0; i < v.size(); ++i) {
+        std::printf("%s[%d,%.5f]", i ? "," : "", v[i].first, v[i].second);
+    }
+    std::printf("]");
+}
+
+static void topk_out(const float* logits, int n, int k, int emit_id) {
+    std::vector<std::pair<int, float>> top;
+    top.reserve(k);
+    for (int i = 0; i < n; ++i) {
+        if ((int) top.size() < k) {
+            top.push_back({i, logits[i]});
+            if ((int) top.size() == k) std::sort(top.begin(), top.end(),
+                                                 [](auto& a, auto& b) { return a.second > b.second; });
+        } else if (logits[i] > top.back().second) {
+            top.back() = {i, logits[i]};
+            for (size_t j = top.size() - 1; j > 0 && top[j].second > top[j - 1].second; --j)
+                std::swap(top[j], top[j - 1]);
+        }
+    }
+    std::printf("{\"id\":%d,", emit_id);
+    json_escape_out("top", top);
+    std::printf("}\n");
+    std::fflush(stdout);
+}
+
+static void serve_reset_state(Engine& e) {
+    CK(cudaSetDevice(e.primary));
+    for (int il = 0; il < kLayers; ++il) {
+        if (e.layers[il].recr) {
+            CK(cudaMemset(e.layers[il].gdn_state, 0, (size_t) kS * kHv * kS * 4));
+            CK(cudaMemset(e.layers[il].conv_state, 0, (size_t) 3 * kQkv * 4));
+        }
+        if (!e.layers[il].recr) {  // only attention layers carry a KV cache
+            CK(cudaMemset(e.layers[il].kcache, 0, (size_t) kMaxCtx * kKv * kHd * 4));
+            CK(cudaMemset(e.layers[il].vcache, 0, (size_t) kMaxCtx * kKv * kHd * 4));
+        }
+    }
+    CK(cudaMemset(e.kcache32, 0, (size_t) kMaxCtx * kKv * kHd * 4));
+    CK(cudaMemset(e.vcache32, 0, (size_t) kMaxCtx * kKv * kHd * 4));
+    CK(cudaMemset(e.partials, 0, (size_t) kEmb / 4 * 4));
+    CK(cudaMemset(e.partials2, 0, (size_t) 2 * (kEmb / 4) * 4));
+}
+
+static int serve_argmax(const float* l) {
+    int best = 0;
+    for (int i = 1; i < kVocab; ++i)
+        if (l[i] > l[best]) best = i;
+    return best;
+}
+
+static void serve_loop(Engine& e) {
+    g_serve_mode = true;
+    capture_graph(e);
+    int pos = 0;
+    bool primed = false;      // seed pass + draft slot 0 done
+    int first_tok = -1;
+    std::string line;
+    std::fprintf(stderr, "rapier serve: ready\n");
+    std::fflush(stderr);
+    while (std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        // naive parse (ints only; the server sends exactly these keys)
+        auto num_in = [&](const char* key) -> long long {
+            const std::string pat = "\"" + std::string(key) + "\":";
+            auto at = line.find(pat);
+            if (at == std::string::npos) return -1;
+            return std::atoll(line.c_str() + at + pat.size());
+        };
+        const bool is_reset = line.find("\"op\":\"reset\"") != std::string::npos;
+        if (is_reset) {
+            serve_reset_state(e);
+            pos = 0;
+            primed = false;
+            first_tok = -1;
+            std::printf("{\"ok\":true,\"op\":\"reset\"}\n");
+            std::fflush(stdout);
+            continue;
+        }
+        const long long gen = num_in("gen");
+        const bool mtp = line.find("\"mtp\":true") != std::string::npos;
+        // tokens array
+        std::vector<int> toks;
+        {
+            auto at = line.find("\"tokens\":[");
+            if (at != std::string::npos) {
+                const char* p = line.c_str() + at + 10;
+                long long v = 0; bool in = false, neg = false;
+                for (; *p && *p != ']'; ++p) {
+                    if (*p == '-') { neg = true; continue; }
+                    if (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); in = true; continue; }
+                    if (in) { toks.push_back((int) (neg ? -v : v)); v = 0; in = false; neg = false; }
+                }
+                if (in) toks.push_back((int) (neg ? -v : v));
+            }
+        }
+        if (toks.empty() || gen <= 0) {
+            std::printf("{\"error\":\"need tokens and gen\"}\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (pos + toks.size() + (size_t) gen + 8 >= (size_t) kMaxCtx) {
+            std::printf("{\"error\":\"context full; send op reset\"}\n");
+            std::fflush(stdout);
+            continue;
+        }
+        const bool use_mtp = mtp && !e.split;
+        if (!primed) first_tok = toks[0];
+        // ingest the request's tokens (each also refreshes e.hlogits / e.h_normed)
+        for (int tok : toks) {
+            forward_token(e, tok, pos);
+            ++pos;
+        }
+        if (!primed) {
+            // seed MTP state: normed hidden of the last ingested token + draft slot 0
+            CK(cudaMemcpyAsync(e.h_save, e.h_normed, (size_t) kEmb * 4, cudaMemcpyDeviceToDevice, e.sp));
+            CK(cudaStreamSynchronize(e.sp));
+            if (use_mtp) draft_predict(e, first_tok, 0, e.h_zero, e.p_zero, false);
+            primed = true;
+        }
+        const float* h_part = e.hn_partials;
+        // the last ingested token's logits (e.hlogits) produced the first generated token
+        int cur = serve_argmax(e.hlogits);
+        auto emit_token = [&](int id) { topk_out(e.hlogits, kVocab, 40, id); };
+        if (!use_mtp) {
+            long long out = 0;
+            while (out < gen) {
+                emit_token(cur);
+                ++out;
+                if (cur == 248046) break;
+                int id = forward_token(e, cur, pos);
+                ++pos;
+                cur = id;
+            }
+            std::printf("{\"done\":true,\"pos\":%d}\n", pos);
+            std::fflush(stdout);
+            continue;
+        }
+        // MTP greedy path: cur is already generated (emitted below); the draft proposes
+        // pos+1 and each batched verify confirms it, exactly like the CLI loop.
+        long long emitted = 1;
+        emit_token(cur);
+        if (cur != 248046) {
+            int cand = draft_predict(e, cur, pos, e.h_save, h_part, true);
+            while (emitted < gen) {
+                launch_token_verify(e, cur, cand, pos);
+                int c0 = serve_argmax(e.hlogits2);
+                int c1 = serve_argmax(e.hlogits2 + kVocab);
+                {
+                    std::vector<std::pair<int, float>> top;
+                    const float* l0 = e.hlogits2;
+                    top.reserve(40);
+                    for (int i = 0; i < kVocab; ++i) {
+                        if ((int) top.size() < 40) {
+                            top.push_back({i, l0[i]});
+                            if ((int) top.size() == 40) std::sort(top.begin(), top.end(),
+                                                                 [](auto& a, auto& b) { return a.second > b.second; });
+                        } else if (l0[i] > top.back().second) {
+                            top.back() = {i, l0[i]};
+                            for (size_t j = top.size() - 1; j > 0 && top[j].second > top[j - 1].second; --j)
+                                std::swap(top[j], top[j - 1]);
+                        }
+                    }
+                    std::printf("{\"id\":%d,", c0);
+                    json_escape_out("top", top);
+                    std::printf("}\n");
+                    std::fflush(stdout);
+                }
+                ++emitted;
+                if (c0 == cand) {
+                    if (emitted < gen) {
+                        std::vector<std::pair<int, float>> top1;
+                        const float* l1 = e.hlogits2 + kVocab;
+                        top1.reserve(40);
+                        for (int i = 0; i < kVocab; ++i) {
+                            if ((int) top1.size() < 40) {
+                                top1.push_back({i, l1[i]});
+                                if ((int) top1.size() == 40) std::sort(top1.begin(), top1.end(),
+                                                                       [](auto& a, auto& b) { return a.second > b.second; });
+                            } else if (l1[i] > top1.back().second) {
+                                top1.back() = {i, l1[i]};
+                                for (size_t j = top1.size() - 1; j > 0 && top1[j].second > top1[j - 1].second; --j)
+                                    std::swap(top1[j], top1[j - 1]);
+                            }
+                        }
+                        std::printf("{\"id\":%d,", c1);
+                        json_escape_out("top", top1);
+                        std::printf("}\n");
+                        std::fflush(stdout);
+                        ++emitted;
+                        cur = c1;
+                        pos += 2;
+                        draft_predict(e, c0, pos - 1, e.h_save, e.h_partials2, false);
+                        cand = draft_predict(e, c1, pos, e.h_save + kEmb, e.h_partials2 + kEmb / 4, true);
+                        h_part = e.h_partials2 + kEmb / 4;
+                    } else {
+                        cur = c0;
+                        pos += 2;
+                    }
+                } else {
+                    for (int il = 0; il < kLayers; ++il) {
+                        if (e.layers[il].recr) {
+                            CK(cudaMemcpyAsync(e.layers[il].gdn_state,
+                                               e.gdn_snap + (size_t) il * (kS * kHv * kS),
+                                               (size_t) kS * kHv * kS * 4, cudaMemcpyDeviceToDevice, e.sp));
+                            CK(cudaMemcpyAsync(e.layers[il].conv_state,
+                                               e.conv_snap + (size_t) il * (3 * kQkv), (size_t) 3 * kQkv * 4,
+                                               cudaMemcpyDeviceToDevice, e.sp));
+                        }
+                    }
+                    cur = c0;
+                    pos += 1;
+                    cand = draft_predict(e, c0, pos, e.h_save, e.h_partials2, true);
+                    h_part = e.h_partials2;
+                }
+                if (cur == 248046) break;
+            }
+        }
+        std::printf("{\"done\":true,\"pos\":%d}\n", pos);
+        std::fflush(stdout);
+    }
+}
+
 int main(int argc, char** argv) {
     std::string model = "/data/hermes/models/qwythos-9b-v2/Qwythos-9B-v2-MTP-Q6_K.gguf";
     std::vector<int> tokens;
+    bool serve_mode = false;
     int ngen = 32;
     float split = 0.0f;
     int device = -1;
@@ -1831,6 +2073,7 @@ int main(int argc, char** argv) {
         else if (a == "--n") ngen = std::atoi(need("--n").c_str());
         else if (a == "--split") split = std::atof(need("--split").c_str());
         else if (a == "--device") device = std::atoi(need("--device").c_str());
+        else if (a == "--serve") serve_mode = true;
         else if (a == "--tokens") {
             std::string s = need("--tokens");
             size_t p = 0;
@@ -1845,7 +2088,8 @@ int main(int argc, char** argv) {
             std::exit(2);
         }
     }
-    if (tokens.empty() || ngen < 1) {
+    if (serve_mode) { g_serve_mode = true; tokens.push_back(0); }  // the arg check below only wants non-empty
+    if (!serve_mode && (tokens.empty() || ngen < 1)) {
         std::fprintf(stderr, "usage: qwythos --tokens id,id --n 32 [--device N] [--split 0.22] [--model path]\n");
         return 2;
     }
@@ -1878,11 +2122,11 @@ int main(int argc, char** argv) {
     if (split <= 0.0f) e.split = 0.0f;
     cudaDeviceProp prop{};
     CK(cudaGetDeviceProperties(&prop, e.primary));
-    std::printf("primary %d %s %.1f GiB\n", e.primary, prop.name,
+    if (!g_serve_mode) std::printf("primary %d %s %.1f GiB\n", e.primary, prop.name,
                 (double) prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
     if (e.split > 0.0f) {
         CK(cudaGetDeviceProperties(&prop, e.secondary));
-        std::printf("secondary %d %s split %.3f\n", e.secondary, prop.name, e.split);
+        if (!g_serve_mode) std::printf("secondary %d %s split %.3f\n", e.secondary, prop.name, e.split);
     }
     std::fflush(stdout);
     try {
@@ -1891,7 +2135,11 @@ int main(int argc, char** argv) {
         alloc_primary(e);
         load_model(e, file);
         auto t1 = std::chrono::steady_clock::now();
-        std::printf("load_s %.2f\n", std::chrono::duration<double>(t1 - t0).count());
+        if (!g_serve_mode) std::printf("load_s %.2f\n", std::chrono::duration<double>(t1 - t0).count());
+        if (serve_mode) {
+            serve_loop(e);
+            return 0;
+        }
         probe_gemv(e);
         capture_graph(e);
         std::vector<int> seq = tokens;

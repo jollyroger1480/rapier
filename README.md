@@ -92,6 +92,27 @@ Diagnostics (env flags): `QWYTHOS_PROBE=1` per-kernel timings + DRAM-ceiling mic
 `QWYTHOS_TOPK=1` top-8 logits of the first token · `QWYTHOS_NOMTP=1` A/B without speculation ·
 `QWYTHOS_MTPTRACE=1` draft/verify decisions · `QWYTHOS_Q6ROWS=1|2|4|8` GEMV sweep.
 
+## Real-life serving (new)
+
+`--serve` turns the engine into a JSON-lines server on stdin/stdout (reset / run ops, greedy-MTP
+bit-exact streams, top-40 logits for sampling, 16K context). `server/rapier_server.py` wraps that
+in an OpenAI-compatible chat API (`/v1/chat/completions`, `/health`, `/v1/models`) with the Qwen
+tokenizer, ChatML template, temperature/top-p sampling, and an incremental conversation session.
+
+Measured on the RX 6950 XT: **50.7 tok/s greedy-MTP, 45.8 tok/s sampled (temp 0.6)** through the
+full HTTP stack (tokenizer → engine → detokenize). The delta to the 73.9 lab number is host-side
+logits transfer + argmax + JSON — GPU top-k is the next lever if it matters.
+
+```sh
+HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible
+curl http://127.0.0.1:8084/v1/chat/completions -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":64,"temperature":0}'
+```
+
+`tests/test_rapier_serve.py` verifies: tokenizer ground-truth encode, 40-token bit-exact engine
+stream vs the recorded MTP run, and a live server chat round-trip. All green.
+
 ## Status & honest limits
 
 A **research prototype benchmarked on one model and one card**: tensor shapes are compile-time

@@ -1,0 +1,1 @@
+My RX 6950 XT now out-decodes llama.cpp on the model it runs every day. Purpose-built HIP decoder for a Qwen3.5-hybrid 9B: 44.8 to 73.9 tok/s greedy, and the MTP speculative path is bit-exact to plain greedy. Benchmarks and bug post-mortems, all public: https://github.com/jollyroger1480/rapier
