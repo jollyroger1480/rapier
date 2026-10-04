@@ -201,3 +201,20 @@ recorded 2401-token run was never diff-checked. Deep-dive findings:
 Speed: 2401-token prompt, first token at 16.5 s = **145 tok/s ingestion** (was 199 claimed;
 the corrected number reflects the real bit-exact path). Graph capture of the batch is
 disabled (Strata wrapper syncs break capture); the 8-wide GEMV batching is the win.
+
+## Addendum 9: all loose ends closed (2026-10-04)
+
+1. **Multi-chunk batch race fixed**: the pinned staging buffer was overwritten by chunk N+1's
+   CPU dequantize while chunk N's async H2D was still in flight — multi-chunk ingestion
+   (batch widths 2/4/6 with several chunks) read torn embeddings. One cudaStreamSynchronize
+   after each chunk closes it; parity now PASS at every width (2/4/6/8), 20 tokens each,
+   bit-exact vs the greedy reference.
+2. **Served speed**: batched detokenization for non-streaming replies (per-token decode was
+   ~13 tok/s of host cost). 60.8 -> **69.2 tok/s served** (raw engine 73.9; remaining gap is
+   HTTP/JSON + sampling, documented).
+3. **Think-fold**: non-streaming responses strip the `<think>` block from content (matching
+   the streaming path's reasoning_content behavior).
+4. Upstream #649 updated with trace-build data: 4/4 clean runs once the resident budget is
+   unpinned — evidence the "hang" was pool starvation from mlock pressure, not a GPU fault.
+5. Boot-state audit: all three brain units disabled at boot (switch-only, as requested) with
+   vmtouch flush-on-stop verified.

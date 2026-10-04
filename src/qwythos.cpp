@@ -2224,6 +2224,9 @@ static void serve_loop(Engine& e) {
                 CK(cudaMemcpyAsync(e.dmeta_b, e.hmeta_b, bn * 4, cudaMemcpyHostToDevice, e.sp));
                 if (e.batch_graph && bn == 8) CK(cudaGraphLaunch(e.batch_graph, e.sp));
                 else serve_ingest_kernels(e, bn);
+                // the next chunk's CPU dequantize would overwrite stage_b while this chunk's
+                // async H2D may still be in flight (torn reads, multi-chunk corruption) — drain
+                CK(cudaStreamSynchronize(e.sp));
                 i += bn;
                 pos += bn;
                 used_batch = true;

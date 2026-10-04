@@ -215,7 +215,7 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
     req = {"op": "run", "tokens": new_tokens, "gen": max_tokens + (1 if skip_first else 0),
            "mtp": bool(greedy)}
     engine_send(req)
-    out_ids, out_text = [], []
+    out_ids, out_text, out_ids_raw = [], [], []
     import random
     rng = random.Random()
     eos_hit = False
@@ -237,7 +237,7 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
             raise RuntimeError(f"engine line missing id: {line}")
         if skip_first:
             skip_first = False
-            out_ids.append(line["id"])   # still counts toward history (it re-states last turn's tail)
+            out_ids.append(line["id"])   # history bookkeeping only; excluded from the reply text
             continue
         tid = line["id"]
         out_ids.append(tid)
@@ -246,8 +246,7 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
         if tid == EOS_ID:
             eos_hit = True
             continue
-        piece = _tk.decode([tid])
-        out_text.append(piece)
+        out_ids_raw.append(tid)
         if on_token is not None:
             seen_new = "".join(out_text)[seen:]
             seen += len(seen_new)
@@ -275,7 +274,8 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
                             on_token(low[:i], True)
                         think_depth = 0
                         low = low[i + 8:]
-    full = "".join(out_text)
+    # one batched decode for the whole reply (token-by-token decode was ~13 tok/s of host cost)
+    full = _tk.decode(out_ids_raw) if out_ids_raw else ""
     return full, full
 
 
@@ -378,6 +378,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": str(e)})
             return
         calls, text = parse_tool_calls(raw) if tools else ([], raw)
+        # non-streaming: fold the think block out of content like the streaming path does
+        if "</think>" in text:
+            head, _, tail = text.partition("</think>")
+            text = (head.strip("\n") + "\n" if head.strip("\n") else "") + tail.lstrip("\n")
         n_gen = len(raw) // 4 or 1
         dt = time.time() - t0
         self._json(200, {
