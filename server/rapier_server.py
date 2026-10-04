@@ -27,7 +27,7 @@ MODEL_FILE = os.environ.get("RAPIER_MODEL", "/data/hermes/models/qwythos-9b-v2/Q
 TOK_DIR = os.environ.get("RAPIER_TOKENIZER", os.path.join(os.path.dirname(__file__), "tokenizer"))
 PORT = int(os.environ.get("RAPIER_PORT", "8084"))
 API_KEY = os.environ.get("RAPIER_API_KEY", "local")
-CTX = int(os.environ.get("RAPIER_CTX", "12288"))          # engine kMaxCtx is 16384; leave headroom
+CTX = int(os.environ.get("RAPIER_CTX", "65536"))          # engine kMaxCtx is 16384; leave headroom
 EOS_ID = 248046
 TOPK = 40
 
@@ -189,8 +189,9 @@ def sample(top, temperature, top_p, rng):
     return probs[-1][0]
 
 
-def generate(messages, max_tokens, temperature, top_p):
-    """Returns (text, raw_text) - raw includes any <tool_call> blocks."""
+def generate(messages, max_tokens, temperature, top_p, on_token=None):
+    """Returns (text, raw_text) - raw includes any <tool_call> blocks.
+    on_token(piece, in_think) streams decoded pieces as they generate (SSE path)."""
     global hist, primed
     engine_start()
     ids = _tk.encode(chat_template(messages)).ids
@@ -213,6 +214,8 @@ def generate(messages, max_tokens, temperature, top_p):
     import random
     rng = random.Random()
     eos_hit = False
+    think_depth = 0
+    seen = 0  # chars of raw already classified (think markers span pieces)
     while True:
         line = engine_recv()
         if line.get("done"):
@@ -234,6 +237,33 @@ def generate(messages, max_tokens, temperature, top_p):
             continue
         piece = _tk.decode([tid])
         out_text.append(piece)
+        if on_token is not None:
+            seen_new = "".join(out_text)[seen:]
+            seen += len(seen_new)
+            low = seen_new
+            while low:
+                if think_depth == 0:
+                    i = low.find("<think>")
+                    if i < 0:
+                        if low:
+                            on_token(low, False)
+                        low = ""
+                    else:
+                        if i:
+                            on_token(low[:i], False)
+                        think_depth = 1
+                        low = low[i + 7:]
+                else:
+                    i = low.find("</think>")
+                    if i < 0:
+                        if low:
+                            on_token(low, True)
+                        low = ""
+                    else:
+                        if i:
+                            on_token(low[:i], True)
+                        think_depth = 0
+                        low = low[i + 8:]
     full = "".join(out_text)
     return full, full
 
@@ -285,6 +315,51 @@ class Handler(BaseHTTPRequestHandler):
             messages = [dict(m) for m in messages]
             if messages:
                 messages[0]["_rapier_tools"] = tools
+        want_stream = bool(body.get("stream"))
+        if want_stream and os.environ.get("RAPIER_TRACE"):
+            import sys as _s
+            print("TRACE: stream request, generating...", file=_s.stderr, flush=True)
+        if want_stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            def sse(obj):
+                try:
+                    self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
+            sse({"id": "rapier", "object": "chat.completion.chunk",
+                 "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
+            def on_tok(piece, in_think):
+                if not piece:
+                    return
+                delta = {"reasoning_content": piece} if in_think else {"content": piece}
+                sse({"id": "rapier", "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": delta, "finish_reason": None}]})
+            try:
+                with eng_lock:
+                    raw, _ = generate(messages, max_tokens, temperature, top_p, on_token=on_tok)
+                if os.environ.get("RAPIER_TRACE"):
+                    import sys as _s
+                    print(f"TRACE: generate returned {len(raw)} chars", file=_s.stderr, flush=True)
+            except Exception as e:
+                sse({"error": str(e)})
+                return
+            calls, text = parse_tool_calls(raw) if tools else ([], raw)
+            if calls:
+                sse({"id": "rapier", "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "finish_reason": None,
+                                  "delta": {"tool_calls": calls}}]})
+                fin = "tool_calls"
+            else:
+                fin = "stop"
+            sse({"id": "rapier", "object": "chat.completion.chunk",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": fin}]})
+            self.wfile.write(b"data: [DONE]\n\n")
+            self.wfile.flush()
+            return
         try:
             with eng_lock:
                 raw, _ = generate(messages, max_tokens, temperature, top_p)

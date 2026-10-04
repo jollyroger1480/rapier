@@ -36,7 +36,7 @@ constexpr int kHd = 256;
 constexpr int kHeads = 16;
 constexpr int kKv = 4;
 constexpr int kRot = 64;
-constexpr int kMaxCtx = 16384;
+constexpr int kMaxCtx = 65536;  // 64K: Hermes Agent minimum; KV cost ~2.4 GB VRAM
 // set at parse time (--serve); silences stdout chatter that would corrupt the JSON protocol
 static bool g_serve_mode = false;
 

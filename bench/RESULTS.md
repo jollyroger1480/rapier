@@ -140,3 +140,12 @@ The bug that ate the afternoon: `generate()` returned on EOS without draining th
 `{"done":true}` line, leaving stale lines in the pipe - every subsequent request read the
 previous response's leftovers (one-request-off hallucinations, misattributed 500s).
 Fix: always drain to done. Lesson: a 1 ms "generation" is a protocol desync, not a speedup.
+
+## Addendum 5: SSE streaming (2026-10-04)
+
+Hermes (and any OpenAI client) streams; the server only returned one JSON blob, so
+streaming clients hung forever. Now: stream:true -> SSE with role chunk, per-token
+deltas split into `reasoning_content` (<think> blocks) vs `content`, tool_calls emitted
+as a single delta when present, finish chunk + [DONE]. First delta lands immediately;
+verified back-to-back requests stable. Context also raised to 64K (Hermes Agent minimum):
+all caches preallocated, 14.5/16 GB VRAM, short-ctx speed unchanged.
