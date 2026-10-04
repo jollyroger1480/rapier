@@ -231,6 +231,9 @@ struct Engine {
     void* scratch_dn8_b = nullptr; // B*q8f
     int* dmeta_b = nullptr;        // B positions
     int* hmeta_b = nullptr;        // host mirror
+    int* dpos_b = nullptr;         // B*kHeads per-head positions (rope reads dpos[head])
+    float* stage_b = nullptr;      // pinned staging for batch embeddings (graph re-reads on replay)
+    cudaGraphExec_t batch_graph = nullptr;
     float* h_partials2 = nullptr;  // matching partials for both hidden columns
     float* z2 = nullptr;           // attention g/z, 2*kEmb
     float* ggate2 = nullptr;       // draft gates, 2*kHv
@@ -895,7 +898,6 @@ void forward_gdn_split(Engine& e, Layer& L) {
 // Big-card path: the whole gated-delta recurrence runs as three launches - beta/gate epilogues, conv+silu+l2+q
 // scale, then the fused step+out-norm whose Q8_1 output feeds ssm_out directly.
 void forward_gdn(Engine& e, Layer& L) {
-    static int g_gdn_layer_call = -1;
     if (g_vtrace) {
         if (g_vtrace_layer < 0) g_vtrace_layer = 0;  // trace only the first layer call after reset
     }
@@ -1004,6 +1006,7 @@ void forward_attn_split(Engine& e, Layer& L) {
 
 // Big-card path: wq/wk/wv ride one GEMV, and the wo input is quantized inside the sigmoid-gate kernel.
 void forward_attn(Engine& e, Layer& L) {
+
     if (e.split > 0.0f) {
         forward_attn_split(e, L);
         return;
@@ -1062,7 +1065,7 @@ void launch_token_gpu(Engine& e) {
 
 // GEMV over two Q8_1 columns: xq8 holds [col0 | col1] blocks, y receives [col0 | col1] outputs.
 // QWYTHOS_GEMV1COLS bisects the multi-column kernel out: two single-column calls on the same bytes.
-void mm_q2(int type, const void* w, const void* xq8, float* y, int n_in, int n_out, cudaStream_t st) {
+void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in, int n_out, cudaStream_t st) {
     if (std::getenv("QWYTHOS_GEMV1COLS")) {
         const size_t col_bytes = (size_t) (n_in / 32) * 36;
         if (type == 14) {
@@ -1074,8 +1077,8 @@ void mm_q2(int type, const void* w, const void* xq8, float* y, int n_in, int n_o
         }
         return;
     }
-    if (type == 14) strata::kernels::native_q6_k_mmvq(w, xq8, y, n_in, n_out, 2, st);
-    else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, 2, st);
+    if (type == 14) strata::kernels::native_q6_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
+    else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else {
         std::fprintf(stderr, "bad gemv2 type %d\n", type);
         std::exit(1);
@@ -1216,8 +1219,8 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify rms");
-            mm_q2(L.qkvz.type, L.qkvz.a, e.scratch_p2, e.qkvz_o2, L.qkvz.n_in, L.qkvz.n_out, e.sp);
-            mm_q2(L.ab.type, L.ab.a, e.scratch_p2, e.ab_o2, L.ab.n_in, L.ab.n_out, e.sp);
+            mm_q2(2, L.qkvz.type, L.qkvz.a, e.scratch_p2, e.qkvz_o2, L.qkvz.n_in, L.qkvz.n_out, e.sp);
+            mm_q2(2, L.ab.type, L.ab.a, e.scratch_p2, e.ab_o2, L.ab.n_in, L.ab.n_out, e.sp);
             static const int vskip1 = std::getenv("QWYTHOS_VSKIP1") ? std::atoi(std::getenv("QWYTHOS_VSKIP1")) : 0;
             for (int c = 0; c < 2; ++c) {
                 if (c == 1 && vskip1) break;
@@ -1252,7 +1255,7 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                 }
             }
             ck_launch("verify gdn");
-            mm_q2(L.ssm_out.type, L.ssm_out.a, e.scratch_up8_2, e.o2, L.ssm_out.n_in, L.ssm_out.n_out, e.sp);
+            mm_q2(2, L.ssm_out.type, L.ssm_out.a, e.scratch_up8_2, e.o2, L.ssm_out.n_in, L.ssm_out.n_out, e.sp);
             for (int c = 0; c < 2; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x2 + (size_t) c * kEmb,
                                                                    e.o2 + (size_t) c * kEmb,
@@ -1266,13 +1269,13 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify ffn rms");
-            mm_q2(L.upgate.type, L.upgate.a, e.scratch_p2, e.ug_o2, L.upgate.n_in, L.upgate.n_out, e.sp);
+            mm_q2(2, L.upgate.type, L.upgate.a, e.scratch_p2, e.ug_o2, L.upgate.n_in, L.upgate.n_out, e.sp);
             for (int c = 0; c < 2; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_o2 + (size_t) c * 2 * kFF, e.ug_o2 + (size_t) c * 2 * kFF + kFF,
                     reinterpret_cast<Q81Row*>((char*) e.scratch_dn8_2 + c * q8f), kFF);
             ck_launch("verify swiglu");
-            mm_q2(L.down.type, L.down.a, e.scratch_dn8_2, e.o2, L.down.n_in, L.down.n_out, e.sp);
+            mm_q2(2, L.down.type, L.down.a, e.scratch_dn8_2, e.o2, L.down.n_in, L.down.n_out, e.sp);
             for (int c = 0; c < 2; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x2 + (size_t) c * kEmb,
                                                                    e.o2 + (size_t) c * kEmb,
@@ -1285,7 +1288,7 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify rms");
-            mm_q2(L.qkv3.type, L.qkv3.a, e.scratch_p2, e.q3_o2, L.qkv3.n_in, L.qkv3.n_out, e.sp);
+            mm_q2(2, L.qkv3.type, L.qkv3.a, e.scratch_p2, e.q3_o2, L.qkv3.n_in, L.qkv3.n_out, e.sp);
             for (int c = 0; c < 2; ++c) {
                 const int* meta_c = c ? e.dmeta1 : e.dmeta;
                 float* qg = e.q3_o2 + (size_t) c * (2 * kHeads * kHd + 2 * kKv * kHd);
@@ -1315,7 +1318,7 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                                    kEmb);
                 ck_launch("verify sig_mul");
             }
-            mm_q2(L.wo.type, L.wo.a, e.scratch_up8_2, e.qkvz_o2, L.wo.n_in, L.wo.n_out, e.sp);
+            mm_q2(2, L.wo.type, L.wo.a, e.scratch_up8_2, e.qkvz_o2, L.wo.n_in, L.wo.n_out, e.sp);
             for (int c = 0; c < 2; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x2 + (size_t) c * kEmb,
                                                                    e.qkvz_o2 + (size_t) c * kEmb,
@@ -1329,13 +1332,13 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify ffn rms");
-            mm_q2(L.upgate.type, L.upgate.a, e.scratch_p2, e.ug_o2, L.upgate.n_in, L.upgate.n_out, e.sp);
+            mm_q2(2, L.upgate.type, L.upgate.a, e.scratch_p2, e.ug_o2, L.upgate.n_in, L.upgate.n_out, e.sp);
             for (int c = 0; c < 2; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_o2 + (size_t) c * 2 * kFF, e.ug_o2 + (size_t) c * 2 * kFF + kFF,
                     reinterpret_cast<Q81Row*>((char*) e.scratch_dn8_2 + c * q8f), kFF);
             ck_launch("verify swiglu");
-            mm_q2(L.down.type, L.down.a, e.scratch_dn8_2, e.o2, L.down.n_in, L.down.n_out, e.sp);
+            mm_q2(2, L.down.type, L.down.a, e.scratch_dn8_2, e.o2, L.down.n_in, L.down.n_out, e.sp);
             for (int c = 0; c < 2; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x2 + (size_t) c * kEmb,
                                                                    e.o2 + (size_t) c * kEmb,
@@ -1350,7 +1353,7 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                      reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e), kEmb,
                                                      e.eps);
     ck_launch("verify out_n");
-    mm_q2(e.out_w.type, e.out_w.a, e.scratch_p2, e.logits2, e.out_w.n_in, e.out_w.n_out, e.sp);
+    mm_q2(2, e.out_w.type, e.out_w.a, e.scratch_p2, e.logits2, e.out_w.n_in, e.out_w.n_out, e.sp);
     // the draft consumes the final-normed hiddens of both columns
     for (int c = 0; c < 2; ++c) {
         rms_norm_out_kernel<<<8, 256, 0, e.sp>>>(e.x2 + (size_t) c * kEmb, (const float*) e.out_n.a,
@@ -1616,7 +1619,7 @@ void alloc_primary(Engine& e) {
     CK(cudaMalloc(&e.q3_o2, (size_t) 2 * (2 * kHeads * kHd + 2 * kKv * kHd) * 4));
     CK(cudaMalloc(&e.up2, (size_t) 2 * kEmb * 4));
     CK(cudaMalloc(&e.z2, (size_t) 2 * kEmb * 4));
-    CK(cudaMalloc(&e.ggate2, (size_t) 2 * kHv * 4));
+    CK(cudaMalloc(&e.ggate2, (size_t) 8 * kHv * 4));  // B=8 batch columns (was 2 — verify-only; batch wrote past it)
     CK(cudaMalloc(&e.partials2, (size_t) 2 * (kEmb / 4) * 4));
     CK(cudaMalloc(&e.scratch_p2, (size_t) 2 * q8));
     CK(cudaMalloc(&e.scratch_up8_2, (size_t) 2 * kEmb / 32 * 36));
@@ -1674,6 +1677,7 @@ void alloc_primary(Engine& e) {
     CK(cudaMalloc(&e.scratch_dn8_b, (size_t) KB * kFF / 32 * 36));
     CK(cudaMalloc(&e.dmeta_b, KB * 4));
     CK(cudaMallocHost(&e.hmeta_b, KB * 4));
+    CK(cudaMalloc(&e.dpos_b, KB * kHeads * 4));
     CK(cudaMalloc(&e.x, (size_t) kEmb * 4));
     CK(cudaMalloc(&e.res, (size_t) kEmb * 4));
     CK(cudaMalloc(&e.o, (size_t) kEmb * 4));
@@ -1904,34 +1908,37 @@ void load_model(Engine& e, const strata::GgufFile& file) {
 // recurrence stays sequential per token (cheap), attention stays per-token against
 // the KV cache with per-token positions.  Mirrors the 2-col verify pass exactly.
 
+static void serve_ingest_kernels(Engine& e, int B);  // kernels-only body, graph-capturable
+
 static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
-    Layer* LS[kLayers];
-    for (int il = 0; il < kLayers; ++il) LS[il] = &e.layers[il];
+    // dequantize B rows into the persistent pinned stage, upload, then run the captured
+    // batch graph (or the eager kernels on first use / capture).  The graph's memcpy node
+    // re-reads this stage buffer on every replay.
+    if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 8 * kEmb * 4));
+    for (int c = 0; c < B; ++c) {
+        const uint8_t* src = e.emb_host + (size_t) toks[c] * e.emb_stride;
+        for (int b = 0; b < kEmb / 256; ++b)
+            strata::dequantize_q6_K(src + (size_t) b * 210, e.stage_b + (size_t) c * kEmb + b * 256);
+    }
+    for (int c = 0; c < B; ++c) e.hmeta_b[c] = pos + c;
+    CK(cudaMemcpyAsync(e.dmeta_b, e.hmeta_b, B * 4, cudaMemcpyHostToDevice, e.sp));
+    CK(cudaMemcpyAsync(e.stage_b, e.stage_b, 0, cudaMemcpyHostToDevice, e.sp));  // ordering barrier
+    serve_ingest_kernels(e, B);
+    pos += B;
+}
+
+// kernels-only body: reads e.xb (already staged) and e.dmeta_b (positions).  Graph-capturable:
+// no syncs, no host-dependent branching, fixed buffer addresses.
+static void serve_ingest_kernels(Engine& e, int B) {
     const size_t q8e = (size_t) kEmb / 32 * 36;
     const size_t q8f = (size_t) kFF / 32 * 36;
-    const float** hparts = (const float**) malloc(sizeof(float*) * 0);  // unused
-    (void) hparts;
-    // dequantize + upload B embedding rows (one pinned staging, one H2D)
-    {
-        static float* stage = nullptr;
-        if (!stage) CK(cudaMallocHost((void**) &stage, (size_t) 8 * kEmb * 4));
-        for (int c = 0; c < B; ++c) {
-            const uint8_t* src = e.emb_host + (size_t) toks[c] * e.emb_stride;
-            for (int b = 0; b < kEmb / 256; ++b)
-                strata::dequantize_q6_K(src + (size_t) b * 210, stage + (size_t) c * kEmb + b * 256);
-        }
-        CK(cudaMemcpyAsync(e.xb, stage, (size_t) B * kEmb * 4, cudaMemcpyHostToDevice, e.sp));
-    }
     for (int c = 0; c < B; ++c)
         row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.xb + (size_t) c * kEmb,
                                                           e.partials_b + (size_t) c * (kEmb / 4), kEmb);
     ck_launch("bp row_sum");
-    // positions pos..pos+B-1 in device memory; kernels read their column's slot
-    for (int c = 0; c < B; ++c) e.hmeta_b[c] = pos + c;
-    CK(cudaMemcpyAsync(e.dmeta_b, e.hmeta_b, B * 4, cudaMemcpyHostToDevice, e.sp));
-
+    // positions arrive in dmeta_b (caller fills it before replay); kernels read their column's slot
     for (int il = 0; il < kLayers; ++il) {
-        Layer& L = *LS[il];
+        Layer& L = e.layers[il];
         if (L.recr) {
             for (int c = 0; c < B; ++c)
                 rms_quant_apply_kernel<<<16, 256, 0, e.sp>>>(
@@ -1939,8 +1946,8 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp rms");
-            mm_q2(L.qkvz.type, L.qkvz.a, e.scratch_pb, e.qkvz_ob, L.qkvz.n_in, L.qkvz.n_out, e.sp);
-            mm_q2(L.ab.type, L.ab.a, e.scratch_pb, e.ab_ob, L.ab.n_in, L.ab.n_out, e.sp);
+            mm_q2(B, L.qkvz.type, L.qkvz.a, e.scratch_pb, e.qkvz_ob, L.qkvz.n_in, L.qkvz.n_out, e.sp);
+            mm_q2(B, L.ab.type, L.ab.a, e.scratch_pb, e.ab_ob, L.ab.n_in, L.ab.n_out, e.sp);
             for (int c = 0; c < B; ++c) {
                 float* beta_c = e.ab_ob + (size_t) c * 2 * kHv;
                 float* alpha_c = beta_c + kHv;
@@ -1958,7 +1965,7 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                                                           (char*) e.scratch_up8_b + c * q8e, kHk, kHv, e.sp);
             }
             ck_launch("bp gdn");
-            mm_q2(L.ssm_out.type, L.ssm_out.a, e.scratch_up8_b, e.ob, L.ssm_out.n_in, L.ssm_out.n_out, e.sp);
+            mm_q2(B, L.ssm_out.type, L.ssm_out.a, e.scratch_up8_b, e.ob, L.ssm_out.n_in, L.ssm_out.n_out, e.sp);
             for (int c = 0; c < B; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
@@ -1970,13 +1977,13 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp ffn rms");
-            mm_q2(L.upgate.type, L.upgate.a, e.scratch_pb, e.ug_ob, L.upgate.n_in, L.upgate.n_out, e.sp);
+            mm_q2(B, L.upgate.type, L.upgate.a, e.scratch_pb, e.ug_ob, L.upgate.n_in, L.upgate.n_out, e.sp);
             for (int c = 0; c < B; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_ob + (size_t) c * 2 * kFF, e.ug_ob + (size_t) c * 2 * kFF + kFF,
                     reinterpret_cast<Q81Row*>((char*) e.scratch_dn8_b + c * q8f), kFF);
             ck_launch("bp swiglu");
-            mm_q2(L.down.type, L.down.a, e.scratch_dn8_b, e.ob, L.down.n_in, L.down.n_out, e.sp);
+            mm_q2(B, L.down.type, L.down.a, e.scratch_dn8_b, e.ob, L.down.n_in, L.down.n_out, e.sp);
             for (int c = 0; c < B; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
@@ -1989,10 +1996,13 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp rms");
-            mm_q2(L.qkv3.type, L.qkv3.a, e.scratch_pb, e.q3_ob, L.qkv3.n_in, L.qkv3.n_out, e.sp);
+            mm_q2(B, L.qkv3.type, L.qkv3.a, e.scratch_pb, e.q3_ob, L.qkv3.n_in, L.qkv3.n_out, e.sp);
             constexpr int kv_n = kKv * kHd;
             for (int c = 0; c < B; ++c) {
                 const int* meta_c = e.dmeta_b + c;
+                // rope reads dpos[head]: fill this column's per-head slot from its position
+                fill_pos_kernel<<<1, 32, 0, e.sp>>>(e.dpos_b + (size_t) c * kHeads, kHeads, meta_c);
+                ck_launch("bp fill_pos");
                 float* qg = e.q3_ob + (size_t) c * (2 * kHeads * kHd + 2 * kKv * kHd);
                 float* k_c = qg + 2 * kHeads * kHd;
                 float* v_c = k_c + kKv * kHd;
@@ -2002,8 +2012,8 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                 rms(e, e.ob + (size_t) c * kEmb, L.qn, kHeads, kHd);
                 rms(e, k_c, L.kn, kKv, kHd);
                 strata::kernels::native_rope_apply(e.ob + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
-                                                   kHeads, kHd, kRot, e.rope, (int*) meta_c, e.sp);
-                strata::kernels::native_rope_apply(k_c, k_c, kKv, kHd, kRot, e.rope, (int*) meta_c, e.sp);
+                                                   kHeads, kHd, kRot, e.rope, e.dpos_b + (size_t) c * kHeads, e.sp);
+                strata::kernels::native_rope_apply(k_c, k_c, kKv, kHd, kRot, e.rope, e.dpos_b + (size_t) c * kHeads, e.sp);
                 store_kv2_kernel<<<(2 * kv_n + 255) / 256, 256, 0, e.sp>>>(L.kcache, L.vcache, k_c, v_c,
                                                                            meta_c, kv_n);
                 ck_launch("bp store_kv");
@@ -2016,7 +2026,7 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                     reinterpret_cast<Q81Row*>((char*) e.scratch_up8_b + c * q8e), kEmb);
                 ck_launch("bp sig_mul");
             }
-            mm_q2(L.wo.type, L.wo.a, e.scratch_up8_b, e.ob, L.wo.n_in, L.wo.n_out, e.sp);
+            mm_q2(B, L.wo.type, L.wo.a, e.scratch_up8_b, e.ob, L.wo.n_in, L.wo.n_out, e.sp);
             for (int c = 0; c < B; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
@@ -2028,13 +2038,13 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp ffn rms");
-            mm_q2(L.upgate.type, L.upgate.a, e.scratch_pb, e.ug_ob, L.upgate.n_in, L.upgate.n_out, e.sp);
+            mm_q2(B, L.upgate.type, L.upgate.a, e.scratch_pb, e.ug_ob, L.upgate.n_in, L.upgate.n_out, e.sp);
             for (int c = 0; c < B; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_ob + (size_t) c * 2 * kFF, e.ug_ob + (size_t) c * 2 * kFF + kFF,
                     reinterpret_cast<Q81Row*>((char*) e.scratch_dn8_b + c * q8f), kFF);
             ck_launch("bp swiglu");
-            mm_q2(L.down.type, L.down.a, e.scratch_dn8_b, e.ob, L.down.n_in, L.down.n_out, e.sp);
+            mm_q2(B, L.down.type, L.down.a, e.scratch_dn8_b, e.ob, L.down.n_in, L.down.n_out, e.sp);
             for (int c = 0; c < B; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
@@ -2042,7 +2052,6 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
             ck_launch("bp down_add");
         }
     }
-    pos += B;
 }
 
 static void json_escape_out(const char* key, const std::vector<std::pair<int, float>>& v) {
@@ -2098,9 +2107,45 @@ static int serve_argmax(const float* l) {
     return best;
 }
 
+
+// Capture the 8-token batch as a graph.  Capture runs with a ZERO staging buffer: a zero
+// token's conv/silu/projections are all zero, k=q=v=0, so the GDN state stays exactly zero
+// (S_new = g*S with S=0) and the KV slots it touches are overwritten by real tokens before
+// any read.  Per replay the caller stages real embeddings + positions into the buffers the
+// captured memcpy/kernel nodes read.
+static void capture_batch_graph(Engine& e) {
+    CK(cudaSetDevice(e.primary));
+    if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 8 * kEmb * 4));
+    CK(cudaMemset(e.stage_b, 0, (size_t) 8 * kEmb * 4));
+    for (int c = 0; c < 8; ++c) e.hmeta_b[c] = c;
+    CK(cudaMemcpy(e.dmeta_b, e.hmeta_b, 8 * 4, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(e.xb, e.stage_b, (size_t) 8 * kEmb * 4, cudaMemcpyHostToDevice));
+    cudaGraph_t g = nullptr;
+    CK(cudaStreamBeginCapture(e.sp, cudaStreamCaptureModeThreadLocal));
+    serve_ingest_kernels(e, 8);
+    CK(cudaStreamEndCapture(e.sp, &g));
+    CK(cudaGraphInstantiate(&e.batch_graph, g, 0ull));
+    CK(cudaGraphDestroy(g));
+    // the capture itself mutated device state with zero tokens: reset what it touched
+    for (int il = 0; il < kLayers; ++il) {
+        if (e.layers[il].recr) {
+            CK(cudaMemset(e.layers[il].gdn_state, 0, (size_t) kS * kHv * kS * 4));
+            CK(cudaMemset(e.layers[il].conv_state, 0, (size_t) 3 * kQkv * 4));
+        }
+    }
+    if (!e.split) { /* KV slots re-written by real tokens before read; nothing to reset */ }
+    if (!g_serve_mode) std::printf("batch graph captured\n");
+}
+
 static void serve_loop(Engine& e) {
     g_serve_mode = true;
-    capture_graph(e);
+    {  // any trace mode or NOBATCH — graphs conflict with syncs in the tail path
+        const bool tracing = std::getenv("QWYTHOS_BLAYERS") || std::getenv("QWYTHOS_BTRACE7") || std::getenv("QWYTHOS_ATRACE");
+        const bool nobatch = std::getenv("QWYTHOS_NOBATCH") != nullptr;
+        if (!tracing && !nobatch) capture_graph(e);
+        // batch graph capture skipped: rms/rope wrappers sync internally, breaking capture.
+        // The batch runs eager serve_ingest_kernels — the 8-wide GEMV batching is the win.
+    }
     int pos = 0;
     bool primed = false;      // seed pass + draft slot 0 done
     int first_tok = -1;
@@ -2161,10 +2206,28 @@ static void serve_loop(Engine& e) {
         {
             int i = 0;
             bool used_batch = false;
-            while (toks.size() - i >= 8) {
-                serve_ingest_chunk(e, toks.data() + i, 8, pos);
-                i += 8;
+            static const bool nobatch = std::getenv("QWYTHOS_NOBATCH") != nullptr;
+            // batch size: 2/4/7/8 via QWYTHOS_BN (default 8); the graph is only valid for its
+            // captured width, so eager kernels run when the width differs
+            static const int bn = [] { const char* v = std::getenv("QWYTHOS_BN"); return v ? std::atoi(v) : 8; }();
+            if (!nobatch) {
+            if (!e.batch_graph && !e.split && bn == 8 && !std::getenv("QWYTHOS_ATRACE")) capture_batch_graph(e);
+            while (toks.size() - i >= (size_t) bn) {
+                if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 8 * kEmb * 4));
+                for (int c = 0; c < bn; ++c) {
+                    const uint8_t* src = e.emb_host + (size_t) toks[(size_t) (i + c)] * e.emb_stride;
+                    for (int b = 0; b < kEmb / 256; ++b)
+                        strata::dequantize_q6_K(src + (size_t) b * 210, e.stage_b + (size_t) c * kEmb + b * 256);
+                }
+                for (int c = 0; c < bn; ++c) e.hmeta_b[c] = pos + c;
+                CK(cudaMemcpyAsync(e.xb, e.stage_b, (size_t) bn * kEmb * 4, cudaMemcpyHostToDevice, e.sp));
+                CK(cudaMemcpyAsync(e.dmeta_b, e.hmeta_b, bn * 4, cudaMemcpyHostToDevice, e.sp));
+                if (e.batch_graph && bn == 8) CK(cudaGraphLaunch(e.batch_graph, e.sp));
+                else serve_ingest_kernels(e, bn);
+                i += bn;
+                pos += bn;
                 used_batch = true;
+            }
             }
             for (; i < (int) toks.size(); ++i) {
                 forward_token(e, toks[(size_t) i], pos);
@@ -2176,13 +2239,16 @@ static void serve_loop(Engine& e) {
                 const int last = toks.back();
                 // recompute the last token alone is WRONG (double ingest); instead derive from the
                 // batch: norm the last column, then lm_head.  The batch already advanced pos past it.
-                rms_norm_out_kernel<<<8, 256, 0, e.sp>>>(e.xb + (size_t) (BATCH - 1) * kEmb,
+                rms_norm_out_kernel<<<8, 256, 0, e.sp>>>(e.xb + (size_t) (bn - 1) * kEmb,
                                                          (const float*) e.out_n.a,
-                                                         e.partials_b + (size_t) (BATCH - 1) * (kEmb / 4),
+                                                         e.partials_b + (size_t) (bn - 1) * (kEmb / 4),
                                                          e.h_normed, kEmb, e.eps);
                 row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.h_normed, e.hn_partials, kEmb);
-                rms_quant_apply_kernel<<<16, 256, 0, e.sp>>>(e.h_normed, (const float*) e.out_n.a,
-                                                             e.hn_partials,
+                // replicate forward_token's project() exactly: quantize (x * w * inv) in one pass
+                // (rms_norm_out's x*w then quantize differs in the last fp bit -> different Q8 codes)
+                rms_quant_apply_kernel<<<16, 256, 0, e.sp>>>(e.xb + (size_t) (bn - 1) * kEmb,
+                                                             (const float*) e.out_n.a,
+                                                             e.partials_b + (size_t) (bn - 1) * (kEmb / 4),
                                                              static_cast<Q81Row*>(e.scratch_p), kEmb, e.eps);
                 mm_q(e.out_w.type, e.out_w.a, e.scratch_p, e.d_logits, e.out_w.n_in, e.out_w.n_out, e.sp);
                 CK(cudaStreamSynchronize(e.sp));
@@ -2529,14 +2595,14 @@ int main(int argc, char** argv) {
             CK(cudaStreamSynchronize(e.sp));
             float v_single_on_p2 = 0;
             CK(cudaMemcpy(&v_single_on_p2, e.q3_o + 8090, 4, cudaMemcpyDeviceToHost));
-            mm_q2(L0.qkvz.type, L0.qkvz.a, e.scratch_p2, e.qkvz_o2, L0.qkvz.n_in, L0.qkvz.n_out, e.sp);
+            mm_q2(2, L0.qkvz.type, L0.qkvz.a, e.scratch_p2, e.qkvz_o2, L0.qkvz.n_in, L0.qkvz.n_out, e.sp);
             CK(cudaStreamSynchronize(e.sp));
             float v_multi_on_p2 = 0;
             CK(cudaMemcpy(&v_multi_on_p2, e.qkvz_o2 + 8090, 4, cudaMemcpyDeviceToHost));
             std::printf("CMPV head2head: single-kernel(scratch_p2) v=%g  multi-kernel(scratch_p2) v=%g  A(single on scratch_p) v=%g\n",
                         v_single_on_p2, v_multi_on_p2, vA);
             std::fflush(stdout);
-            mm_q2(L0.ab.type, L0.ab.a, e.scratch_p2, e.ab_o2, L0.ab.n_in, L0.ab.n_out, e.sp);
+            mm_q2(2, L0.ab.type, L0.ab.a, e.scratch_p2, e.ab_o2, L0.ab.n_in, L0.ab.n_out, e.sp);
             float* beta_b = e.ab_o2;
             float* alpha_b = beta_b + kHv;
             beta_gate_kernel<<<1, 64, 0, e.sp>>>(beta_b, alpha_b, L0.ssm_dt, L0.ssm_a, e.ggate2, kHv);
@@ -2558,7 +2624,7 @@ int main(int argc, char** argv) {
             CK(cudaStreamSynchronize(e.sp));
             float upB = 0;
             CK(cudaMemcpy(&upB, e.up2 + probe, 4, cudaMemcpyDeviceToHost));
-            mm_q2(L0.ssm_out.type, L0.ssm_out.a, e.scratch_up8_2, e.o2, L0.ssm_out.n_in, L0.ssm_out.n_out, e.sp);
+            mm_q2(2, L0.ssm_out.type, L0.ssm_out.a, e.scratch_up8_2, e.o2, L0.ssm_out.n_in, L0.ssm_out.n_out, e.sp);
             CK(cudaStreamSynchronize(e.sp));
             float ssmB = 0;
             CK(cudaMemcpy(&ssmB, e.o2 + probe, 4, cudaMemcpyDeviceToHost));
@@ -2566,10 +2632,10 @@ int main(int argc, char** argv) {
             rms_quant_apply_kernel<<<16, 256, 0, e.sp>>>(e.x2, (const float*) L0.post_norm.a, e.partials2,
                                                          reinterpret_cast<Q81Row*>((char*) e.scratch_p2), kEmb,
                                                          e.eps);
-            mm_q2(L0.upgate.type, L0.upgate.a, e.scratch_p2, e.ug_o2, L0.upgate.n_in, L0.upgate.n_out, e.sp);
+            mm_q2(2, L0.upgate.type, L0.upgate.a, e.scratch_p2, e.ug_o2, L0.upgate.n_in, L0.upgate.n_out, e.sp);
             swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(e.ug_o2, e.ug_o2 + kFF,
                                                              static_cast<Q81Row*>(e.scratch_dn8_2), kFF);
-            mm_q2(L0.down.type, L0.down.a, e.scratch_dn8_2, e.o2, L0.down.n_in, L0.down.n_out, e.sp);
+            mm_q2(2, L0.down.type, L0.down.a, e.scratch_dn8_2, e.o2, L0.down.n_in, L0.down.n_out, e.sp);
             add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x2, e.o2, e.partials2, kEmb);
             CK(cudaStreamSynchronize(e.sp));
             float xB = 0;

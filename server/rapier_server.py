@@ -208,7 +208,12 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
         engine_reset()              # context full or conversation changed: start over
         new_tokens = ids
     greedy = (temperature or 0) < 1e-5
-    req = {"op": "run", "tokens": new_tokens, "gen": max_tokens, "mtp": bool(greedy)}
+    # On a follow-up (delta-only) request the engine still emits the argmax of the LAST INGESTED
+    # token - which the previous turn already produced. Skip exactly one stale emission so the
+    # stream starts at the genuinely new token.
+    skip_first = bool(hist) and shared > 0 and not new_tokens is None and len(new_tokens) >= 0 and primed
+    req = {"op": "run", "tokens": new_tokens, "gen": max_tokens + (1 if skip_first else 0),
+           "mtp": bool(greedy)}
     engine_send(req)
     out_ids, out_text = [], []
     import random
@@ -218,6 +223,8 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
     seen = 0  # chars of raw already classified (think markers span pieces)
     while True:
         line = engine_recv()
+        if line.get("ok") or line.get("op"):
+            continue  # stale ack from a reset; not part of this run's stream
         if line.get("done"):
             # ALWAYS drain to done: an early return here leaves stale lines in the pipe and
             # every later request reads the previous response's leftovers (off-by-one-request).
@@ -228,6 +235,10 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
             continue  # engine stops itself after eos; ignore anything until done
         if "id" not in line:
             raise RuntimeError(f"engine line missing id: {line}")
+        if skip_first:
+            skip_first = False
+            out_ids.append(line["id"])   # still counts toward history (it re-states last turn's tail)
+            continue
         tid = line["id"]
         out_ids.append(tid)
         if not greedy and tid != EOS_ID and "top" in line and line["top"]:

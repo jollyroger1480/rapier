@@ -176,3 +176,28 @@ a wave64 layout (64-lane shfl butterflies) for Instinct/Radeon VII; on gfx1030
 wave32 the 64-lane ops emulate 2x32. Also in the update: q8_1_finite quantize
 hardening (correctness only), a swiglu+quantize kernel we already ship our own of,
 gfx906 perm lookups. Nothing else moves /fast on gfx1030.
+
+## Addendum 8: batched prefill correctness fix (2026-10-04)
+
+The original batched prefill (Addendum 6) was WRONG and its "parity PASS" was a testing
+artefact: a 5-token test took the per-token tail path (never exercised the batch), and the
+recorded 2401-token run was never diff-checked. Deep-dive findings:
+
+1. The multi-column GEMVs are EXACT (micro-tested single-vs-multi, both quant formats,
+   widths 2/4/8 — 0 diff). The kernels were never the problem.
+2. Real bug #1: the batch finalize quantized the pre-normed hidden (rms_norm_out then
+   quantize), whose fp multiply order differs by one bit from rms_quant_apply's
+   (x*w)*inv — different Q8 codes, wrong logits. Fixed by mirroring forward_token's
+   project() exactly. 20-token batched-ingest parity now PASS (ids bit-exact vs the
+   greedy reference).
+3. Real bug #2 (session follow-ups): delta-only requests re-emitted the previous turn's
+   last token (stale first argmax). Server now skips exactly one stale emission; 3-turn
+   conversation verified (Paris / Paris->follow / Rome).
+4. Debug-probe discipline: syncs inside probes break stream capture ("operation not
+   permitted when stream is capturing") — probes must be env-gated AND the 1-token graph
+   capture must be skipped in any trace mode. Several hours lost to capture/probe
+   interactions before that was untangled.
+
+Speed: 2401-token prompt, first token at 16.5 s = **145 tok/s ingestion** (was 199 claimed;
+the corrected number reflects the real bit-exact path). Graph capture of the batch is
+disabled (Strata wrapper syncs break capture); the 8-wide GEMV batching is the win.
