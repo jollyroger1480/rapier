@@ -19,7 +19,7 @@ index 9f69dd9..9d95919 100644
                       float* y, int n_in, int n_out, int ncols, void* stream);
  
 diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
-index e0a4c1b..2b3a08d 100644
+index e0a4c1b..4994a6e 100644
 --- a/src/kernels/cuda/native_mmvq.cu
 +++ b/src/kernels/cuda/native_mmvq.cu
 @@ -622,13 +622,15 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
@@ -41,6 +41,15 @@ index e0a4c1b..2b3a08d 100644
      constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
      const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
      const int row0 = ROWS * int(blockIdx.x);
+@@ -997,7 +999,7 @@ struct SmallTraits {
+ bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
+ 
+ template<typename F, int NCOLS, int NW, int ROWS>
+-__launch_bounds__(NW * WARP, 1)
++__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))  //  upstream 0.1.39: occupancy for small-ROWS multi GEMV
+ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
+                                          const Q81Block* __restrict__ x,
+                                          float* __restrict__ y, int n_in, int n_out) {
 @@ -1163,6 +1165,135 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
      launch_check();
  }

@@ -36,8 +36,10 @@ starting point: **44.8 → 73.9 tok/s (+65%)**.
   and step+RMS-norm+SiLU with an in-kernel **Q8_1 epilogue** (the next GEMV's input is quantized
   inside the recurrence kernel). 9 kernel launches per layer → 3.
 - **`patches/0002-mmvq-rows-residual.patch`** — rows-per-block as a template knob for the Q6_K MMVQ,
-  plus **residual-epilogue GEMV variants** that fold the residual add and the next norm's
-  sum-of-squares partials into the GEMV itself (deletes 64 kernels/token).
+  **residual-epilogue GEMV variants** that fold the residual add and the next norm's
+  sum-of-squares partials into the GEMV itself (deletes 64 kernels/token), and the 0.1.39
+  multi-column occupancy bump (minBlocksPerSM 4 for ROWS<=2), ported and benchmarked neutral
+  on this DRAM-bound path.
 - **`bench/RESULTS.md`** — the full measurement log: per-kernel bandwidths, the DRAM-ceiling
   experiments (a plain float4 read kernel measures ~482 GB/s on this card; both engines sit at that
   wall), clock/power forensics, and the bug post-mortems.

@@ -163,3 +163,16 @@ Parity: batched-ingest continuation matches the greedy reference stream exactly.
 
 Roadmap: ncols 16, real GEMM prefill (borrow Strata's prefill kernels), capture the
 batch as a graph. Each is another multiple.
+
+## Addendum 7: upstream port review (2026-10-04, Strata 0.1.39+, 818 commits)
+
+Ported the one portable perf change — the multi-column GEMV occupancy bump
+(minBlocksPerSM 1 -> 4 for ROWS<=2, now part of patch 0002). Result: 69-72 tok/s
+(parity exact, first-gen logit 13.992725 unchanged) — within noise; our GEMVs were
+already DRAM-bound, and occupancy helps latency-bound kernels.
+
+Not portable: upstream's new `native_mmvq_wave_kernel` is gated STRATA_HIP_GFX906 —
+a wave64 layout (64-lane shfl butterflies) for Instinct/Radeon VII; on gfx1030
+wave32 the 64-lane ops emulate 2x32. Also in the update: q8_1_finite quantize
+hardening (correctness only), a swiglu+quantize kernel we already ship our own of,
+gfx906 perm lookups. Nothing else moves /fast on gfx1030.
