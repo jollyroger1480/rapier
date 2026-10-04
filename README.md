@@ -99,9 +99,11 @@ bit-exact streams, top-40 logits for sampling, 16K context). `server/rapier_serv
 in an OpenAI-compatible chat API (`/v1/chat/completions`, `/health`, `/v1/models`) with the Qwen
 tokenizer, ChatML template, temperature/top-p sampling, and an incremental conversation session.
 
-Measured on the RX 6950 XT: **50.7 tok/s greedy-MTP, 45.8 tok/s sampled (temp 0.6)** through the
-full HTTP stack (tokenizer → engine → detokenize). The delta to the 73.9 lab number is host-side
-logits transfer + argmax + JSON — GPU top-k is the next lever if it matters.
+Measured on the RX 6950 XT through the full HTTP stack: **60.8 tok/s greedy-MTP** (GPU argmax,
+no logits round-trip), ~46 tok/s sampled. **64K context** (caches preallocated at load), SSE
+streaming with `reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion is
+batched: 8-token chunks on the multi-column GEMVs at **199 tok/s** (3x per-token), so agent-size
+system prompts are a one-time cost per session — later turns ingest only the new tokens.
 
 ```sh
 HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible
