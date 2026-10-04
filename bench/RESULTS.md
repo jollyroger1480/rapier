@@ -149,3 +149,17 @@ deltas split into `reasoning_content` (<think> blocks) vs `content`, tool_calls 
 as a single delta when present, finish chunk + [DONE]. First delta lands immediately;
 verified back-to-back requests stable. Context also raised to 64K (Hermes Agent minimum):
 all caches preallocated, 14.5/16 GB VRAM, short-ctx speed unchanged.
+
+## Addendum 6: batched prefill (2026-10-04)
+
+Agent sessions prepend huge system prompts; per-token ingestion (weights re-read per
+token, ~350 MB) made those minutes-long. Now the serve path ingests in chunks of 8
+riding the multi-column GEMVs (weights once per chunk, bitwise per column), GDN
+sequential per token (cheap), attention per-token against the cache.
+
+Measured: 2401-token prompt ingested at **199 tok/s** (12 s, was ~36 s per-token),
+first generated token at 12 s. Live HTTP: 1188-token prompt + answer in 6.2 s.
+Parity: batched-ingest continuation matches the greedy reference stream exactly.
+
+Roadmap: ncols 16, real GEMM prefill (borrow Strata's prefill kernels), capture the
+batch as a graph. Each is another multiple.
