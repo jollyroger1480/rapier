@@ -109,11 +109,16 @@ bit-exact streams, top-40 logits for sampling, 16K context). `server/rapier_serv
 in an OpenAI-compatible chat API (`/v1/chat/completions`, `/health`, `/v1/models`) with the Qwen
 tokenizer, ChatML template, temperature/top-p sampling, and an incremental conversation session.
 
-Measured on the RX 6950 XT through the full HTTP stack: **60.8 tok/s greedy-MTP** (GPU argmax,
-no logits round-trip), ~46 tok/s sampled. **64K context** (caches preallocated at load), SSE
-streaming with `reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion is
-batched: 8-token chunks on the multi-column GEMVs at **199 tok/s** (3x per-token), so agent-size
-system prompts are a one-time cost per session — later turns ingest only the new tokens.
+Measured on the RX 6950 XT (2026-10-07 retest, 0.1.40.3 base, ROCm 10.1) through the full HTTP
+stack: **75.9 tok/s greedy-MTP** (GPU argmax, no logits round-trip; 76.6 tok/s engine CLI),
+~46 tok/s sampled. **64K context** (caches preallocated at load), SSE streaming with
+`reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion rides 8-token
+chunks on the multi-column GEMVs and slows as attention history grows — per-token attention
+over an ever-longer KV: **~150 tok/s at a 2k prompt, 86 at 8k, 54 at 16k** (identical on the
+0.1.37 base — position scaling, not a port cost). Later turns ingest only the new tokens.
+An experimental hipBLAS prefill (`QWYTHOS_GEMM=1`, ≤128-token chunks) exists in the tree but
+currently measures ~half the chunked path and prints debug lines into the serve stream —
+off by default until it wins.
 
 ```sh
 HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible

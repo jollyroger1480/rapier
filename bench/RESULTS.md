@@ -218,3 +218,39 @@ disabled (Strata wrapper syncs break capture); the 8-wide GEMV batching is the w
    unpinned — evidence the "hang" was pool starvation from mlock pressure, not a GPU fault.
 5. Boot-state audit: all three brain units disabled at boot (switch-only, as requested) with
    vmtouch flush-on-stop verified.
+
+## Addendum 10: 0.1.40.3 rebase + serving retest (2026-10-07)
+
+Port rebased onto upstream **v0.1.40.3** (branch `port/qwythos-0.1.40` in the Strata fork).
+Our two RDNA2 fixes shipped upstream in 0.1.40 (gfx1030 portable `alignas` in iq_kernels,
+split-shard architecture guard in native_dense) and come back with the base; patch 0002's
+0.1.39 occupancy bump is also upstream since 0.1.40. Upstream #606 (q8_1 blocks keep finite
+d/sum — massive activations overflowed fp16 to inf*0=NaN) folded into rapier's four
+in-kernel quantizers via `strata/kernels/q8_1_finite.hpp`. Kernel merges were clean: the
+0.1.40.3 q6_k MMVQ kernel body is byte-identical to 0.1.37's, `gdn.cu` unchanged, and
+fused_gdn.cu takes both upstream's `red_kv`/`red_o` split and rapier's Silu/WithQ8 templating.
+
+Verified: engine CLI 400-token greedy-MTP **76.6 tok/s** (0.1.37 base: 73.9), token ids
+**bit-identical** to the 0.1.37 build (diff of the full 64-token stream), `qwen35_gdn_multi`
+parity rel 1.991e-08 (same figure as the 0.1.37 build). Built with ROCm 10.1 (the 7.1 in
+earlier notes is stale).
+
+Serving retest (HTTP through rapier_server.py, RX 6950 XT, greedy):
+
+| path | number | note |
+| --- | --- | --- |
+| served decode, 400-token run | **75.9 tok/s** (engine-time) | old README claim 60.8 |
+| ingest, default 8-tok chunks, 2k prompt | 153 tok/s | short prompts run near the old "199" claim |
+| ingest, default, 8k prompt | 86 tok/s | identical on the 0.1.37 build (86.0 vs 86.0) |
+| ingest, default, 16k prompt | 54 tok/s | per-token attention over growing KV — position scaling |
+| ingest, `QWYTHOS_GEMM=1`, 8k / 16k | 41 / 28 tok/s | experimental hipBLAS prefill: ~half the chunked path |
+
+The "199 tok/s" ingestion claim in older notes was a short-prompt figure; ingestion rate
+falls with position on both builds (quadratic-ish total cost, per-token attention). The
+GEMM prefill stays opt-in: slower than the chunked path as of this retest, and it prints
+~119 `gemm_y0` debug lines per 8k ingest into the serve stream (protocol pollution).
+
+Pre-existing quirk found while benching (not a regression): resending the exact same
+messages makes the server send a run op with empty `tokens`, which the engine rejects —
+the client sees HTTP 500 "engine line missing id: need tokens and gen". Same guard on the
+0.1.37-based engine; real sessions always append, so it only bites resend-style clients.
