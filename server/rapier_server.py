@@ -214,6 +214,12 @@ def generate(messages, max_tokens, temperature, top_p, on_token=None):
     skip_first = bool(hist) and shared > 0 and not new_tokens is None and len(new_tokens) >= 0 and primed
     req = {"op": "run", "tokens": new_tokens, "gen": max_tokens + (1 if skip_first else 0),
            "mtp": bool(greedy)}
+    # Live progress during the silent ingest: Hermes agent prompts are tens of thousands
+    # of tokens and the bar otherwise sits at 0% until the first generated token.
+    n_new = len(new_tokens)
+    if on_token is not None and n_new > 256:
+        eta = max(1, int(n_new / 140))
+        on_token(f"[rapier ingesting {n_new} prompt tokens, ~{eta}s]\n", True)
     engine_send(req)
     out_ids, out_text, out_ids_raw = [], [], []
     import random
