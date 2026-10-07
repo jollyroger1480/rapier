@@ -12,6 +12,9 @@ Rapier is a single-model HIP decode engine for the **qwen35 architecture** (the 
 Gated-DeltaNet linear-attention layers + GQA every 4th layer + an MTP draft head), built as a program
 and two kernel patches inside a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)
 (the MoE engine for Qwen3.8-Flash-Next — itself built on [llama.cpp/ggml](https://github.com/ggml-org/llama.cpp)).
+Patches are cut against upstream **v0.1.40.3**; the two RDNA2 fixes rapier contributed upstream
+(portable `alignas` shared-memory declaration for gfx1030, split-shard architecture guard) shipped
+in 0.1.40, so the port now inherits them instead of carrying them.
 
 It exists because on RDNA2, a decoder purpose-built for one model beats a general one:
 
@@ -27,19 +30,23 @@ starting point: **44.8 → 73.9 tok/s (+65%)**.
 
 ## What's in the box
 
-- **`src/qwythos.cpp`** (~2.9k lines) — the whole decode engine as one program: Q6_K/Q8_0 dp4a GEMVs
-  with a CUDA-graph-captured token, fused rms-norm+Q8_1 quantize, weight-matrix concatenation
-  (qkv‖z, α‖β, up‖gate, wq‖wk‖wv — one GEMV launch per group), residual-add epilogues fused into the
-  GEMVs, a flash-decode-style **parallel attention kernel** (one block per head), and a
-  **2-column batched MTP verify pass** that streams the weights once for both tokens.
+- **`src/qwythos.cpp`** (~3.0k lines, plus `src/qwythos_prefill.cu`) — the whole decode engine as one
+  program: Q6_K/Q8_0 dp4a GEMVs with a CUDA-graph-captured token, fused rms-norm+Q8_1 quantize,
+  weight-matrix concatenation (qkv‖z, α‖β, up‖gate, wq‖wk‖wv — one GEMV launch per group),
+  residual-add epilogues fused into the GEMVs, a flash-decode-style **parallel attention kernel**
+  (one block per head), a **2-column batched MTP verify pass** that streams the weights once for
+  both tokens, and a true-prefill path (hipBLAS GEMM, one weight read for T tokens) for ingesting
+  long prompts.
 - **`patches/0001-fused-gdn-silu-q8.patch`** — the fused Gated-DeltaNet chain: conv+SiLU+L2(+q-scale),
   and step+RMS-norm+SiLU with an in-kernel **Q8_1 epilogue** (the next GEMV's input is quantized
-  inside the recurrence kernel). 9 kernel launches per layer → 3.
+  inside the recurrence kernel), on top of 0.1.40's split-reduction `red_kv`/`red_o` shape. The
+  epilogue quantizes through `q8_1_finite.hpp` (#606) so massive-activation blocks keep a finite
+  d/sum instead of inf·0 = NaN. 9 kernel launches per layer → 3.
 - **`patches/0002-mmvq-rows-residual.patch`** — rows-per-block as a template knob for the Q6_K MMVQ,
   **residual-epilogue GEMV variants** that fold the residual add and the next norm's
-  sum-of-squares partials into the GEMV itself (deletes 64 kernels/token), and the 0.1.39
-  multi-column occupancy bump (minBlocksPerSM 4 for ROWS<=2), ported and benchmarked neutral
-  on this DRAM-bound path.
+  sum-of-squares partials into the GEMV itself (deletes 64 kernels/token). The 0.1.39
+  multi-column occupancy bump (minBlocksPerSM 4 for ROWS<=2) is part of upstream since 0.1.40 —
+  the patch no longer carries it.
 - **`bench/RESULTS.md`** — the full measurement log: per-kernel bandwidths, the DRAM-ceiling
   experiments (a plain float4 read kernel measures ~482 GB/s on this card; both engines sit at that
   wall), clock/power forensics, and the bug post-mortems.
@@ -63,15 +70,16 @@ You need: an AMD RDNA2 card (tested: RX 6950 XT, gfx1030; ROCm ≥ 6 with HIPCC)
 ```sh
 git clone https://github.com/Niko1221/Strata
 cd Strata
+git checkout v0.1.40.3        # the release these patches are cut against
 git apply /path/to/rapier/patches/*.patch
-cp /path/to/rapier/src/qwythos.cpp src/program/
+cp /path/to/rapier/src/qwythos.cpp /path/to/rapier/src/qwythos_prefill.cu src/program/
 
 # add the target (or copy the block from the patch notes in docs/BUILD.md):
 cat >> CMakeLists.txt <<'EOF'
 if(STRATA_ENABLE_HIP)
-  add_executable(qwythos src/program/qwythos.cpp)
-  set_source_files_properties(src/program/qwythos.cpp PROPERTIES LANGUAGE HIP)
-  target_link_libraries(qwythos PRIVATE strata_kernels strata_hip_runtime)
+  add_executable(qwythos src/program/qwythos.cpp src/program/qwythos_prefill.cu)
+  set_source_files_properties(src/program/qwythos.cpp src/program/qwythos_prefill.cu PROPERTIES LANGUAGE HIP)
+  target_link_libraries(qwythos PRIVATE strata_kernels strata_prefill strata_hip_runtime)
 endif()
 EOF
 

@@ -1,5 +1,5 @@
 diff --git a/include/strata/kernels/fused_gdn.hpp b/include/strata/kernels/fused_gdn.hpp
-index 0cf7c66..606b032 100644
+index 0cf7c66c..606b0322 100644
 --- a/include/strata/kernels/fused_gdn.hpp
 +++ b/include/strata/kernels/fused_gdn.hpp
 @@ -32,4 +32,16 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
@@ -20,18 +20,20 @@ index 0cf7c66..606b032 100644
 +
  }  // namespace strata::kernels
 diff --git a/src/kernels/cuda/fused_gdn.cu b/src/kernels/cuda/fused_gdn.cu
-index ef2e778..99ae552 100644
+index 5d39cd2d..8b09f614 100644
 --- a/src/kernels/cuda/fused_gdn.cu
 +++ b/src/kernels/cuda/fused_gdn.cu
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,9 @@
  // src/kernels/cuda/fused_gdn.cu - see include/strata/kernels/fused_gdn.hpp.
  #include "strata/kernels/fused_gdn.hpp"
  
++#include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1 blocks stay finite
++
 +#include <cuda_fp16.h>
  #include <cuda_runtime.h>
  
  #include <cstdio>
-@@ -13,13 +14,34 @@ constexpr int S = 128;          // state size (rows = cols = 128)
+@@ -13,13 +16,34 @@ constexpr int S = 128;          // state size (rows = cols = 128)
  constexpr int RG = 4;           // row groups
  constexpr int RPG = S / RG;     // 32 rows per thread
  
@@ -65,9 +67,9 @@ index ef2e778..99ae552 100644
 +                                                               float* __restrict__ y, uint8_t* __restrict__ q8,
 +                                                               int h_k, int h_v) {
      __shared__ float sk[S], sq[S];
-     __shared__ float red[RG][S];
-     __shared__ float wsum[S * RG / 32];
-@@ -35,7 +57,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
+     __shared__ float red_kv[RG][S];
+     __shared__ float red_o[RG][S];
+@@ -36,7 +60,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
  #pragma unroll
      for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
      __syncthreads();
@@ -76,7 +78,7 @@ index ef2e778..99ae552 100644
      float kv = 0.0f;
  #pragma unroll
      for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
-@@ -66,7 +88,23 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
+@@ -66,7 +90,23 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_kernel(float* __restrict
          const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
          const float scale = rsqrtf(ss / (float) S + eps);
          const float zz = z[head * S + col];
@@ -89,31 +91,35 @@ index ef2e778..99ae552 100644
 +            // so the amax/sum reductions match native_quantize_q8_1's per-warp xor trees exactly.
 +            const float amax = warp_max32(fabsf(yv));
 +            const float sum = warp_sum32(yv);
-+            const float d = amax / 127.0f;
-+            const int8_t qc = amax == 0.0f ? 0 : (int8_t) roundf(yv / d);
++            const float d = q8_1_finite(amax / 127.0f);      // #606: keep d/sum finite (massive activations)
++            const int8_t qc = q8_1_quant(yv, d, amax);
 +            Q8OutBlock* blk = reinterpret_cast<Q8OutBlock*>(q8) + (size_t) head * 4 + (col >> 5);
 +            blk->qs[col & 31] = qc;
 +            if ((col & 31) == 0) {
-+                const __half2 ds = __floats2half2_rn(d, sum);
++                const __half2 ds = q8_1_ds(d, sum);
 +                blk->ds = *reinterpret_cast<const uint32_t*>(&ds);
 +            }
 +        }
      }
  }
  
-@@ -80,7 +118,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
+@@ -80,7 +120,30 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
      hist[c * 3] = v1;
      hist[c * 3 + 1] = v2;
      hist[c * 3 + 2] = x;
 -    float y = sum / (1.0f + __expf(-sum));
 +    float y = sum / (1.0f + expf(-sum));
-     if ((int) blockIdx.x < qk_heads) {
-         float sq = y * y;
-         for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
-@@ -92,6 +130,30 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
-     h[c] = y;
- }
- 
++    if ((int) blockIdx.x < qk_heads) {
++        float sq = y * y;
++        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
++        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
++        __syncthreads();
++        const float ss = part[0] + part[1] + part[2] + part[3];
++        y *= rsqrtf(ss + eps);
++    }
++    h[c] = y;
++}
++
 +// qwen35: q heads additionally take the trunk's 1/sqrt(S) scale AFTER the L2 norm, as scale_inplace did.
 +__global__ void __launch_bounds__(S) gdn_conv_l2_qk_kernel(float* __restrict__ hist, const float* __restrict__ qkv,
 +                                                           const float* __restrict__ w, float* __restrict__ h,
@@ -126,22 +132,18 @@ index ef2e778..99ae552 100644
 +    hist[c * 3 + 1] = v2;
 +    hist[c * 3 + 2] = x;
 +    float y = sum / (1.0f + expf(-sum));
-+    if ((int) blockIdx.x < qk_heads) {
-+        float sq = y * y;
-+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
-+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
-+        __syncthreads();
-+        const float ss = part[0] + part[1] + part[2] + part[3];
-+        y *= rsqrtf(ss + eps);
+     if ((int) blockIdx.x < qk_heads) {
+         float sq = y * y;
+         for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+@@ -88,6 +151,7 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_kernel(float* __restrict__ hist
+         __syncthreads();
+         const float ss = part[0] + part[1] + part[2] + part[3];
+         y *= rsqrtf(ss + eps);
 +        if ((int) blockIdx.x < q_heads) y *= q_scale;
-+    }
-+    h[c] = y;
-+}
-+
- __global__ void __launch_bounds__(256) gdn_ab_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
-                                                      const uint16_t* __restrict__ wb, const float* __restrict__ dt,
-                                                      const float* __restrict__ ssm_a, float* __restrict__ gate,
-@@ -135,6 +197,19 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
+     }
+     h[c] = y;
+ }
+@@ -135,6 +199,19 @@ void fused_gdn_conv_l2(float* history, const float* qkv, const float* conv_w, fl
      if (e != cudaSuccess) { std::fprintf(stderr, "fused_gdn_conv_l2: %s\n", cudaGetErrorString(e)); std::exit(1); }
  }
  
@@ -161,7 +163,7 @@ index ef2e778..99ae552 100644
  void fused_gdn_ab(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                    float* gate, float* beta, int n_embd, int h_v, void* stream) {
      if (!x || !w_alpha || !w_beta || !dt || !ssm_a || !gate || !beta || n_embd % 8 != 0 || h_v <= 0) {
-@@ -154,8 +229,8 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
+@@ -154,8 +231,8 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
          std::fprintf(stderr, "fused_gdn_step_norm: invalid arguments\n");
          std::exit(1);
      }
@@ -172,7 +174,7 @@ index ef2e778..99ae552 100644
      const cudaError_t e = cudaGetLastError();
      if (e != cudaSuccess) {
          std::fprintf(stderr, "fused_gdn_step_norm: %s\n", cudaGetErrorString(e));
-@@ -163,4 +238,25 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
+@@ -163,4 +240,25 @@ void fused_gdn_step_norm(float* state, const float* q, const float* k, const flo
      }
  }
  

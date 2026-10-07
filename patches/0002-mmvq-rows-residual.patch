@@ -1,8 +1,8 @@
 diff --git a/include/strata/kernels/native_mmvq.hpp b/include/strata/kernels/native_mmvq.hpp
-index 9f69dd9..9d95919 100644
+index 799ef7db..24515f7d 100644
 --- a/include/strata/kernels/native_mmvq.hpp
 +++ b/include/strata/kernels/native_mmvq.hpp
-@@ -72,6 +72,15 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
+@@ -75,6 +75,15 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
  void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream);
  
@@ -19,10 +19,10 @@ index 9f69dd9..9d95919 100644
                       float* y, int n_in, int n_out, int ncols, void* stream);
  
 diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
-index e0a4c1b..4994a6e 100644
+index 3ef2dcbf..c3e29dad 100644
 --- a/src/kernels/cuda/native_mmvq.cu
 +++ b/src/kernels/cuda/native_mmvq.cu
-@@ -622,13 +622,15 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
+@@ -664,13 +664,15 @@ __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
      return q6_q8_dot_impl(vl, vh, u, w->scales + scale_offset, w->d, d8);
  }
  
@@ -41,16 +41,7 @@ index e0a4c1b..4994a6e 100644
      constexpr int BLOCKS_PER_ITER = WARPS * WARP / 32;
      const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
      const int row0 = ROWS * int(blockIdx.x);
-@@ -997,7 +999,7 @@ struct SmallTraits {
- bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
- 
- template<typename F, int NCOLS, int NW, int ROWS>
--__launch_bounds__(NW * WARP, 1)
-+__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))  //  upstream 0.1.39: occupancy for small-ROWS multi GEMV
- __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
-                                          const Q81Block* __restrict__ x,
-                                          float* __restrict__ y, int n_in, int n_out) {
-@@ -1163,6 +1165,135 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
+@@ -2095,6 +2097,135 @@ void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_
      launch_check();
  }
  
@@ -186,7 +177,7 @@ index e0a4c1b..4994a6e 100644
  void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
      validate_shape(n_in, ncols, QK);
-@@ -1376,11 +1507,18 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
+@@ -2315,11 +2446,18 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
      const auto* x = static_cast<const Q81Block*>(x_q8_1);
      const auto s = static_cast<cudaStream_t>(stream);
      const dim3 threads(WARP, WARPS);
