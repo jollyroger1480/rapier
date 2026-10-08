@@ -3,7 +3,7 @@
 <h1 align="center">⚔️ Rapier</h1>
 
 <p align="center"><b>Fast local decode for Qwen3.5-class hybrid models on AMD RDNA2 — with exact-verify MTP.</b><br>
-74 tok/s greedy from a 9B Gated-DeltaNet hybrid on an RX 6950 XT — faster than llama.cpp Vulkan on the same card.<br>
+76.6 tok/s greedy from a 9B Gated-DeltaNet hybrid on an RX 6950 XT — faster than llama.cpp Vulkan on the same card.<br>
 Built at [Buccaneer Salvage](https://github.com/jollyroger1480) · X [@jollyroger1480](https://x.com/jollyroger1480)</p>
 
 ---
@@ -26,7 +26,8 @@ It exists because on RDNA2, a decoder purpose-built for one model beats a genera
 
 Long-context note: before Rapier's attention rewrite the same workload collapsed to **12.6 tok/s**
 at position ~200 (a single-warp GQA kernel); it is now flat across context. Total speedup over the
-starting point: **44.8 → 73.9 tok/s (+65%)**.
+starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07 rebase):
+76.6 tok/s @ 400 greedy-MTP from the CLI, 75.9 through HTTP serving.
 
 ## What's in the box
 
