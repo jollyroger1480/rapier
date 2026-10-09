@@ -48,6 +48,13 @@ starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07
   sum-of-squares partials into the GEMV itself (deletes 64 kernels/token). The 0.1.39
   multi-column occupancy bump (minBlocksPerSM 4 for ROWS<=2) is part of upstream since 0.1.40 —
   the patch no longer carries it.
+- **`src/qwythos_prefill.cu`** — the **batched GEMM prefill**: hipBLAS projections over T tokens
+  plus T-token GDN/attention kernels (per-channel conv with the window in registers, the delta-rule
+  step with the whole GDN state in registers across the chunk, flash-decode attention per token ×
+  head). Replaced the per-token ingest loops (~300 launches+syncs per token): **ingestion 84 → 155
+  tok/s at 8k, 53 → 144 at 16k, bit-exact vs the per-token path** (`QWYTHOS_PF_SEQ=1` A/B).
+- **`src/test_res.cpp`** — synthetic parity harness for the MMVQ residual-epilogue kernels
+  (bit-exact checks; run on a sacrificial card).
 - **`bench/RESULTS.md`** — the full measurement log: per-kernel bandwidths, the DRAM-ceiling
   experiments (a plain float4 read kernel measures ~482 GB/s on this card; both engines sit at that
   wall), clock/power forensics, and the bug post-mortems.
