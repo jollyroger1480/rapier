@@ -2211,6 +2211,130 @@ void native_q6_k_mmvq_res(const void* weights, const void* x_q8_1, float* y, con
     launch_check();
 }
 
+// Residual-epilogue Q5_K: the q5_k MMVQ iteration (QI/VDR shared constants) with the q6 res epilogue.
+__global__ void native_q5_k_mmvq_res_kernel(const Q5KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                            float* __restrict__ y, const float* __restrict__ res,
+                                            float* __restrict__ partials, int n_in, int n_out) {
+    constexpr int ROWS = 4;
+    constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / QK;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * (QK / Q8K);
+        const int kqs = VDR * (tid % (QI / VDR));
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += q5_q8_dot(w + block, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+    }
+    if (threadIdx.x == 0) {
+        float p = 0.0f;
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const float v = tmp[i] + res[row0 + i];
+                y[row0 + i] = v;
+                p += v * v;
+            }
+        }
+        partials[blockIdx.x] = p;
+    }
+}
+
+// Residual-epilogue Q4_K: the q4_k MMVQ iteration with the q6 res epilogue.
+__global__ void native_q4_k_mmvq_res_kernel(const Q4KBlock* __restrict__ w, const Q81Block* __restrict__ x,
+                                            float* __restrict__ y, const float* __restrict__ res,
+                                            float* __restrict__ partials, int n_in, int n_out) {
+    constexpr int ROWS = 4;
+    constexpr int BLOCKS_PER_ITER = VDR * WARPS * WARP / QI;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / QK;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / (QI / VDR); kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * (QK / Q8K);
+        const int kqs = VDR * (tid % (QI / VDR));
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += q4_q8_dot(w + block, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+    }
+    if (threadIdx.x == 0) {
+        float p = 0.0f;
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const float v = tmp[i] + res[row0 + i];
+                y[row0 + i] = v;
+                p += v * v;
+            }
+        }
+        partials[blockIdx.x] = p;
+    }
+}
+
+void native_q5_k_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
+                          int n_in, int n_out, void* stream) {
+    validate_shape(n_in, 1, QK);
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_pointer(res);
+    validate_pointer(partials);
+    validate_stream(stream);
+    const unsigned blocks = unsigned((std::size_t(n_out) + 3) / 4);
+    native_q5_k_mmvq_res_kernel<<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Q5KBlock*>(weights), static_cast<const Q81Block*>(x_q8_1), y, res, partials, n_in, n_out);
+    launch_check();
+}
+
+void native_q4_k_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
+                          int n_in, int n_out, void* stream) {
+    validate_shape(n_in, 1, QK);
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_pointer(res);
+    validate_pointer(partials);
+    validate_stream(stream);
+    const unsigned blocks = unsigned((std::size_t(n_out) + 3) / 4);
+    native_q4_k_mmvq_res_kernel<<<blocks, dim3(WARP, WARPS), 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Q4KBlock*>(weights), static_cast<const Q81Block*>(x_q8_1), y, res, partials, n_in, n_out);
+    launch_check();
+}
+
 void native_q8_0_mmvq_res(const void* weights, const void* x_q8_1, float* y, const float* res, float* partials,
                           int n_in, int n_out, void* stream) {
     validate_shape(n_in, 1, 32);

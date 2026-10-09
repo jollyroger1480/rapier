@@ -91,7 +91,17 @@ size_t row_bytes(int type, int n_in) {
     if (type == 0) return (size_t) n_in * 4;
     if (type == 8) return (size_t) (n_in / 32) * 34;
     if (type == 14) return (size_t) (n_in / 256) * 210;
+    if (type == 13) return (size_t) (n_in / 256) * 176;
+    if (type == 12) return (size_t) (n_in / 256) * 144;
     return 0;
+}
+
+// Token-embedding block dequant: block format is the GGUF's token_embd type
+// (Q6_K 210 B/256, Q5_K 176 B/256, Q4_K 144 B/256).
+static inline void emb_dequant_block(int type, const uint8_t* src, size_t b, float* dst) {
+    if (type == 13) strata::dequantize_q5_K(src + b * 176, dst + b * 256);
+    else if (type == 12) strata::dequantize_q4_K(src + b * 144, dst + b * 256);
+    else strata::dequantize_q6_K(src + b * 210, dst + b * 256);
 }
 
 struct Tensor {
@@ -252,6 +262,7 @@ struct Engine {
     int* hmeta1 = nullptr;
     const uint8_t* emb_host = nullptr;
     size_t emb_stride = 0;
+    int emb_type = 14;   // GGUF quant of token_embd (14=Q6_K, 13=Q5_K, 12=Q4_K)
     int max_tail = 0;
     Mat out_w, out_n;
     Layer layers[kLayers];
@@ -575,7 +586,10 @@ __global__ void stream_read_kernel(const float4* __restrict__ src, float* __rest
 
 void mm_q(int type, const void* w, const void* xq, float* y, int n_in, int n_out, cudaStream_t st) {
     if (n_out <= 0) return;
+    if (std::getenv("QWYTHOS_DBG")) std::fprintf(stderr, "mm_q t%d w=%p x=%p in=%d out=%d\n", type, w, xq, n_in, n_out);
     if (type == 14) strata::kernels::native_q6_k_mmvq(w, xq, y, n_in, n_out, 1, st);
+    else if (type == 13) strata::kernels::native_q5_k_mmvq(w, xq, y, n_in, n_out, 1, st);
+    else if (type == 12) strata::kernels::native_q4_k_mmvq(w, xq, y, n_in, n_out, 1, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq, y, n_in, n_out, 1, st);
     else {
         std::fprintf(stderr, "bad gemv type %d\n", type);
@@ -679,7 +693,10 @@ void apply_mm_q8(Engine& e, const Mat& m, const void* xq8, float* y) {
 // next rms-norm.  Used when y and res are the same buffer (the pre-norm residual row).
 void mm_q_res(int type, const void* w, const void* xq8, float* y, float* partials, int n_in, int n_out,
               cudaStream_t st) {
+    if (std::getenv("QWYTHOS_DBG")) std::fprintf(stderr, "mm_q_res t%d w=%p in=%d out=%d\n", type, w, n_in, n_out);
     if (type == 14) strata::kernels::native_q6_k_mmvq_res(w, xq8, y, y, partials, n_in, n_out, st);
+    else if (type == 13) strata::kernels::native_q5_k_mmvq_res(w, xq8, y, y, partials, n_in, n_out, st);
+    else if (type == 12) strata::kernels::native_q4_k_mmvq_res(w, xq8, y, y, partials, n_in, n_out, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq_res(w, xq8, y, y, partials, n_in, n_out, st);
     else {
         std::fprintf(stderr, "bad res gemv type %d\n", type);
@@ -746,7 +763,7 @@ void upload_mat(Engine& e, Mat& m, const Tensor& t) {
     m.type = t.type;
     m.n_in = t.n_in;
     m.n_out = t.n_out;
-    if (t.type != 14 && t.type != 8) {
+    if (t.type != 14 && t.type != 13 && t.type != 12 && t.type != 8) {
         std::fprintf(stderr, "upload_mat type %d\n", t.type);
         std::exit(1);
     }
@@ -920,9 +937,11 @@ void forward_gdn(Engine& e, Layer& L) {
         rms_quant_row(e, e.x, L.attn_norm);
         apply_mm(e, L.qkvz, e.x, e.qkvz_o, true);
     } else {
-        float* ys[4] = {e.qkv, e.z, e.beta, e.alpha};
-        const Mat ms[4] = {L.qkv, L.z_w, L.beta_w, L.alpha_w};
-        project(e, e.x, L.attn_norm, ms, ys, 4);
+        // Mixed-type files: cat_ab may have succeeded and nulled beta_w/alpha_w even when
+        // cat_qkvz failed - project only the qkv/z pair, beta/alpha ride the ab group below.
+        float* ys[2] = {e.qkv, e.z};
+        const Mat ms[2] = {L.qkv, L.z_w};
+        project(e, e.x, L.attn_norm, ms, ys, 2);
     }
     float* qkv_v = L.cat_qkvz ? e.qkvz_o : e.qkv;
     float* z_v = L.cat_qkvz ? e.qkvz_o + kQkv : e.z;
@@ -1082,6 +1101,9 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
         if (type == 14) {
             strata::kernels::native_q6_k_mmvq(w, xq8, y, n_in, n_out, 1, st);
             strata::kernels::native_q6_k_mmvq(w, (const char*) xq8 + col_bytes, y + n_out, n_in, n_out, 1, st);
+        } else if (type == 13 || type == 12) {
+            mm_q(type, w, xq8, y, n_in, n_out, st);
+            mm_q(type, w, (const char*) xq8 + col_bytes, y + n_out, n_in, n_out, st);
         } else {
             strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, 1, st);
             strata::kernels::native_q8_0_mmvq(w, (const char*) xq8 + col_bytes, y + n_out, n_in, n_out, 1, st);
@@ -1089,6 +1111,8 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
         return;
     }
     if (type == 14) strata::kernels::native_q6_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
+    else if (type == 13) strata::kernels::native_q5_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
+    else if (type == 12) strata::kernels::native_q4_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else {
         std::fprintf(stderr, "bad gemv2 type %d\n", type);
@@ -1107,7 +1131,7 @@ int draft_predict(Engine& e, int next_tok, int pos, const float* h_prev, const f
     CK(cudaMemcpyAsync(e.dmeta, e.hmeta, sizeof(int), cudaMemcpyHostToDevice, e.sp));
     const uint8_t* src = e.emb_host + (size_t) next_tok * e.emb_stride;
     for (int b = 0; b < kEmb / 256; ++b)
-        strata::dequantize_q6_K(src + (size_t) b * 210, e.emb_row + b * 256);
+        emb_dequant_block(e.emb_type, src, b, e.emb_row);
     CK(cudaSetDevice(e.primary));
     CK(cudaMemcpyAsync(e.x2, e.emb_row, (size_t) kEmb * 4, cudaMemcpyHostToDevice, e.sp));
     row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x2, e.partials2, kEmb);
@@ -1207,7 +1231,7 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
         const int tok = c ? tokB : tokA;
         const uint8_t* src = e.emb_host + (size_t) tok * e.emb_stride;
         for (int b = 0; b < kEmb / 256; ++b)
-            strata::dequantize_q6_K(src + (size_t) b * 210, e.emb_row2 + (size_t) c * kEmb + b * 256);
+            emb_dequant_block(e.emb_type, src, b, e.emb_row2 + (size_t) c * kEmb);
     }
     CK(cudaMemcpyAsync(e.x2, e.emb_row2, (size_t) 2 * kEmb * 4, cudaMemcpyHostToDevice, e.sp));
     CK(cudaSetDevice(e.primary));
@@ -1551,7 +1575,7 @@ int forward_token(Engine& e, int token, int pos) {
     }
     const uint8_t* src = e.emb_host + (size_t) token * e.emb_stride;
     for (int b = 0; b < kEmb / 256; ++b)
-        strata::dequantize_q6_K(src + (size_t) b * 210, e.hrow + b * 256);
+        emb_dequant_block(e.emb_type, src, b, e.hrow);
     e.hmeta[0] = pos;
     CK(cudaSetDevice(e.primary));
     CK(cudaEventRecord(e.ev_layer, e.sp));
@@ -1766,12 +1790,13 @@ void load_model(Engine& e, const strata::GgufFile& file) {
                 e.rope.factor, e.rope.freq_base, e.rope.orig_ctx, e.eps);
 
     Tensor emb = take(file, "token_embd.weight");
-    if (emb.type != 14 || emb.n_in != kEmb || emb.n_out != kVocab) {
+    if ((emb.type != 14 && emb.type != 13 && emb.type != 12) || emb.n_in != kEmb || emb.n_out != kVocab) {
         std::fprintf(stderr, "unexpected embedding\n");
         std::exit(1);
     }
+    e.emb_type = emb.type;
     e.emb_host = emb.data;
-    e.emb_stride = row_bytes(14, kEmb);
+    e.emb_stride = row_bytes(emb.type, kEmb);
     upload_mat(e, e.out_w, take(file, "output.weight"));
     expect_f32(e, e.out_n, take(file, "output_norm.weight"), kEmb);
 
@@ -1933,7 +1958,7 @@ static void serve_ingest_chunk(Engine& e, const int* toks, int B, int& pos) {
     for (int c = 0; c < B; ++c) {
         const uint8_t* src = e.emb_host + (size_t) toks[c] * e.emb_stride;
         for (int b = 0; b < kEmb / 256; ++b)
-            strata::dequantize_q6_K(src + (size_t) b * 210, e.stage_b + (size_t) c * kEmb + b * 256);
+            emb_dequant_block(e.emb_type, src, b, e.stage_b + (size_t) c * kEmb);
     }
     for (int c = 0; c < B; ++c) e.hmeta_b[c] = pos + c;
     CK(cudaMemcpyAsync(e.dmeta_b, e.hmeta_b, B * 4, cudaMemcpyHostToDevice, e.sp));
@@ -2133,7 +2158,7 @@ static void prefill_gemm_chunk(Engine& e, const int* toks, int T, int& pos) {
     for (int t = 0; t < T; ++t) {
         const uint8_t* src = e.emb_host + (size_t) toks[t] * e.emb_stride;
         for (int b = 0; b < kEmb / 256; ++b)
-            strata::dequantize_q6_K(src + (size_t) b * 210, stage.data() + (size_t) t * kEmb + b * 256);
+            emb_dequant_block(e.emb_type, src, b, stage.data() + (size_t) t * kEmb);
     }
     CK(cudaMemcpy(X, stage.data(), stage.size() * 4, cudaMemcpyHostToDevice));
     std::vector<int> hpos(T * kHeads);
@@ -2448,7 +2473,7 @@ static void serve_loop(Engine& e) {
                 for (int c = 0; c < bn; ++c) {
                     const uint8_t* src = e.emb_host + (size_t) toks[(size_t) (i + c)] * e.emb_stride;
                     for (int b = 0; b < kEmb / 256; ++b)
-                        strata::dequantize_q6_K(src + (size_t) b * 210, e.stage_b + (size_t) c * kEmb + b * 256);
+                        emb_dequant_block(e.emb_type, src, b, e.stage_b + (size_t) c * kEmb);
                 }
                 for (int c = 0; c < bn; ++c) e.hmeta_b[c] = pos + c;
                 CK(cudaMemcpyAsync(e.xb, e.stage_b, (size_t) bn * kEmb * 4, cudaMemcpyHostToDevice, e.sp));
@@ -2731,7 +2756,7 @@ int main(int argc, char** argv) {
             {
                 const uint8_t* src = e.emb_host + (size_t) cur * e.emb_stride;
                 for (int b = 0; b < kEmb / 256; ++b)
-                    strata::dequantize_q6_K(src + (size_t) b * 210, e.emb_row + b * 256);
+                    emb_dequant_block(e.emb_type, src, b, e.emb_row);
             }
             CK(cudaMemcpyAsync(e.x, e.emb_row, (size_t) kEmb * 4, cudaMemcpyHostToDevice, e.sp));
             row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x, e.partials, kEmb);
@@ -2761,7 +2786,7 @@ int main(int argc, char** argv) {
             {
                 const uint8_t* srcb = e.emb_host + (size_t) cur * e.emb_stride;
                 for (int b = 0; b < kEmb / 256; ++b)
-                    strata::dequantize_q6_K(srcb + (size_t) b * 210, e.emb_row + b * 256);
+                    emb_dequant_block(e.emb_type, srcb, b, e.emb_row);
             }
             CK(cudaMemcpyAsync(e.x, e.emb_row, (size_t) kEmb * 4, cudaMemcpyHostToDevice, e.sp));
             row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.x, e.partials, kEmb);
