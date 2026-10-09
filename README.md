@@ -55,6 +55,12 @@ starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07
   tok/s at 8k, 53 → 144 at 16k, bit-exact vs the per-token path** (`QWYTHOS_PF_SEQ=1` A/B).
 - **`src/test_res.cpp`** — synthetic parity harness for the MMVQ residual-epilogue kernels
   (bit-exact checks; run on a sacrificial card).
+- **Quantized builds** (see bench/RESULTS.md addenda): the fast-brain GGUF is an
+  **imatrix-weighted Q5_K_M built from the BF16 safetensors** — held-out PPL 8.530 vs the
+  Q6_K's 8.505, MTP acceptance at parity (0.50 vs 0.46 mean), decode +32% on the same card.
+  The quantization pipeline: llama.cpp `imatrix` on 571 KB of real calibration text →
+  `llama-quantize` from the F16 conversion. Requantizing the Q6_K file instead double-quantizes
+  and costs measurably more quality — always quantize from the source.
 - **`bench/RESULTS.md`** — the full measurement log: per-kernel bandwidths, the DRAM-ceiling
   experiments (a plain float4 read kernel measures ~482 GB/s on this card; both engines sit at that
   wall), clock/power forensics, and the bug post-mortems.
