@@ -12,7 +12,7 @@ Rapier is a single-model HIP decode engine for the **qwen35 architecture** (the 
 Gated-DeltaNet linear-attention layers + GQA every 4th layer + an MTP draft head), built as a program
 and two kernel patches inside a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)
 (the MoE engine for Qwen3.8-Flash-Next — itself built on [llama.cpp/ggml](https://github.com/ggml-org/llama.cpp)).
-Patches are cut against upstream **v0.1.40.3**; the two RDNA2 fixes rapier contributed upstream
+Patches are cut against upstream **v0.1.41**; the two RDNA2 fixes rapier contributed upstream
 (portable `alignas` shared-memory declaration for gfx1030, split-shard architecture guard) shipped
 in 0.1.40, so the port now inherits them instead of carrying them.
 
@@ -113,13 +113,11 @@ tokenizer, ChatML template, temperature/top-p sampling, and an incremental conve
 Measured on the RX 6950 XT (2026-10-07 retest, 0.1.40.3 base, ROCm 10.1) through the full HTTP
 stack: **75.9 tok/s greedy-MTP** (GPU argmax, no logits round-trip; 76.6 tok/s engine CLI),
 ~46 tok/s sampled. **64K context** (caches preallocated at load), SSE streaming with
-`reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion rides 8-token
-chunks on the multi-column GEMVs and slows as attention history grows — per-token attention
-over an ever-longer KV: **~150 tok/s at a 2k prompt, 86 at 8k, 54 at 16k** (identical on the
-0.1.37 base — position scaling, not a port cost). Later turns ingest only the new tokens.
-An experimental hipBLAS prefill (`QWYTHOS_GEMM=1`, ≤128-token chunks) exists in the tree but
-currently measures ~half the chunked path and prints debug lines into the serve stream —
-off by default until it wins.
+`reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion is the
+**batched GEMM prefill** (hipBLAS projections + T-token GDN/attention kernels, default
+since the v0.1.41 rebase): **~150 tok/s at 2–8k prompts, 144 at 16k** — the old chunked
+path (86 @8k, 54 @16k) stays reachable with `QWYTHOS_NOGEMM=1`. Later turns ingest only
+the new tokens.
 
 ```sh
 HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible
