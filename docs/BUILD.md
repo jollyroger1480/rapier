@@ -1,6 +1,6 @@
 # Build notes
 
-Rapier tracks upstream Strata **v0.1.41**: `git checkout v0.1.40.3` before applying
+Rapier tracks upstream Strata **v0.1.42**: `git checkout v0.1.40.3` before applying
 `patches/*.patch` (they are cut as a diff against that tag).
 
 The exact CMake block (also inline in the README) that adds the `qwythos` target to a
@@ -23,7 +23,7 @@ The engine picks the largest visible GPU. With a small second card in the box, p
 big one: `HIP_VISIBLE_DEVICES=1 ./build-hip/qwythos ...`.
 
 Post-update checks: 0.1.37 → 0.1.40.3 rebase (2026-10-07): 76.6 tok/s, ids bit-identical.
-0.1.40.3 → 0.1.41 rebase (2026-10-08): same invariant, plus the batched GEMM prefill
-kernels (155 tok/s @8k ingest, bit-exact A/B vs the per-token path via
+0.1.40.3 → 0.1.41 (2026-10-08) and → 0.1.42 (2026-10-10) rebases: same invariant,
+batched GEMM prefill now the default (155-157 tok/s @8k ingest, bit-exact A/B via
 QWYTHOS_PF_SEQ=1). `build-hip/test_res` = synthetic parity harness for the MMVQ
 residual-epilogue kernels (run on a sacrificial card, not your display GPU).
