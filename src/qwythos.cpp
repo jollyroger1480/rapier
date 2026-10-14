@@ -976,10 +976,9 @@ void forward_gdn(Engine& e, Layer& L) {
         // No q scale here: the fused step-norm multiplies its output by rsqrtf(S), which is the same 1/sqrt(128)
         // the old chain applied to q - but applied AFTER the state read-out, so the out-norm's eps sees the same
         // magnitudes it did in the old chain.
-        strata::kernels::fused_gdn_conv_l2_qk(L.conv_state, qkv_v, L.conv_w, qkv_v, kQkv, 2 * kHk, 0, 0.0f,
-                                              e.eps, e.sp);
-        strata::kernels::fused_gdn_step_norm_silu(L.gdn_state, qkv_v, qkv_v + kHk * kS, qkv_v + 2 * kHk * kS, e.ggate,
-                                                  beta_v, z_v, L.ssm_norm, e.eps, e.up, e.scratch_up8, kHk, kHv, e.sp);
+        strata::kernels::fused_gdn_conv_l2(L.conv_state, qkv_v, L.conv_w, qkv_v, kQkv, 2 * kHk, e.eps, e.sp);
+        strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv_v, qkv_v + kHk * kS, qkv_v + 2 * kHk * kS, e.ggate,
+                                                  beta_v, z_v, L.ssm_norm, e.eps, e.up, (uint8_t*) (uint8_t*) e.scratch_up8, kHk, kHv, e.sp);
     }
     vtrace(2, e.qkvz_o);   // after GEMVs (single)
     vtrace(3, e.ggate);
@@ -1267,12 +1266,11 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                 beta_gate_kernel<<<1, 64, 0, e.sp>>>(beta_v, alpha_v, L.ssm_dt, L.ssm_a,
                                                      e.ggate2 + (size_t) c * kHv, kHv);
                 ck_launch("verify beta_gate");
-                strata::kernels::fused_gdn_conv_l2_qk(L.conv_state, qkv_c, L.conv_w, qkv_c, kQkv, 2 * kHk, 0, 0.0f,
-                                                      e.eps, e.sp);
-                strata::kernels::fused_gdn_step_norm_silu(L.gdn_state, qkv_c, qkv_c + kHk * kS, qkv_c + 2 * kHk * kS,
+                strata::kernels::fused_gdn_conv_l2(L.conv_state, qkv_c, L.conv_w, qkv_c, kQkv, 2 * kHk, e.eps, e.sp);
+                strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv_c, qkv_c + kHk * kS, qkv_c + 2 * kHk * kS,
                                                           e.ggate2 + (size_t) c * kHv, beta_v, z_c,
                                                           L.ssm_norm, e.eps, e.up2 + (size_t) c * kEmb,
-                                                          (char*) e.scratch_up8_2 + c * q8e, kHk, kHv, e.sp);
+                                                          (uint8_t*) e.scratch_up8_2 + c * q8e, kHk, kHv, e.sp);
                 if (c == 0) {
                     // snapshot the state after col0's step: col1's step must be undoable on rejection
                     CK(cudaMemcpyAsync(e.gdn_snap + (size_t) il * (kS * kHv * kS), L.gdn_state,
@@ -1996,13 +1994,12 @@ static void serve_ingest_kernels(Engine& e, int B) {
                 beta_gate_kernel<<<1, 64, 0, e.sp>>>(beta_c, alpha_c, L.ssm_dt, L.ssm_a,
                                                      e.ggate2 + (size_t) c * kHv, kHv);
                 ck_launch("bp beta_gate");
-                strata::kernels::fused_gdn_conv_l2_qk(L.conv_state, qkv_c, L.conv_w, qkv_c, kQkv, 2 * kHk, 0,
-                                                      0.0f, e.eps, e.sp);
-                strata::kernels::fused_gdn_step_norm_silu(L.gdn_state, qkv_c, qkv_c + kHk * kS,
+                strata::kernels::fused_gdn_conv_l2(L.conv_state, qkv_c, L.conv_w, qkv_c, kQkv, 2 * kHk, e.eps, e.sp);
+                strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv_c, qkv_c + kHk * kS,
                                                           qkv_c + 2 * kHk * kS, e.ggate2 + (size_t) c * kHv,
                                                           beta_c, z_c, L.ssm_norm, e.eps,
                                                           e.upb + (size_t) c * kEmb,
-                                                          (char*) e.scratch_up8_b + c * q8e, kHk, kHv, e.sp);
+                                                          (uint8_t*) e.scratch_up8_b + c * q8e, kHk, kHv, e.sp);
             }
             ck_launch("bp gdn");
             mm_q2(B, L.ssm_out.type, L.ssm_out.a, e.scratch_up8_b, e.ob, L.ssm_out.n_in, L.ssm_out.n_out, e.sp);
@@ -2253,10 +2250,10 @@ static void prefill_gemm_chunk(Engine& e, const int* toks, int T, int& pos) {
                     float* z = qkv + kQkv;
                     float* beta = R + (size_t) t * 2 * kHv;
                     beta_gate_kernel<<<1, 64, 0, e.sp>>>(beta, beta + kHv, L.ssm_dt, L.ssm_a, e.ggate, kHv);
-                    strata::kernels::fused_gdn_conv_l2_qk(L.conv_state, qkv, L.conv_w, qkv, kQkv, 2 * kHk, 0, 0.f, e.eps, e.sp);
-                    strata::kernels::fused_gdn_step_norm_silu(L.gdn_state, qkv, qkv + kHk * kS, qkv + 2 * kHk * kS,
+                    strata::kernels::fused_gdn_conv_l2(L.conv_state, qkv, L.conv_w, qkv, kQkv, 2 * kHk, e.eps, e.sp);
+                    strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv, qkv + kHk * kS, qkv + 2 * kHk * kS,
                                                               e.ggate, beta, z, L.ssm_norm, e.eps,
-                                                              S + (size_t) t * kEmb, (char*) e.scratch_up8, kHk, kHv, e.sp);
+                                                              S + (size_t) t * kEmb, (uint8_t*) (uint8_t*) e.scratch_up8, kHk, kHv, e.sp);
                 }
             } else {
                 pf_beta_gate(R, g_pf.pf_bgate, L.ssm_dt, L.ssm_a, kHv, T, e.sp);
@@ -2899,15 +2896,14 @@ int main(int argc, char** argv) {
             float vinA = 0, csA = 0;
             CK(cudaMemcpy(&vinA, e.qkvz_o + 8090, 4, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(&csA, L0.conv_state + 3 * 8090, 4, cudaMemcpyDeviceToHost));
-            strata::kernels::fused_gdn_conv_l2_qk(L0.conv_state, e.qkvz_o, L0.conv_w, e.qkvz_o, kQkv, 2 * kHk, 0,
-                                                  0.0f, e.eps, e.sp);
+            strata::kernels::fused_gdn_conv_l2(L0.conv_state, e.qkvz_o, L0.conv_w, e.qkvz_o, kQkv, 2 * kHk, e.eps, e.sp);
             CK(cudaStreamSynchronize(e.sp));
             float convA = 0;
             CK(cudaMemcpy(&convA, e.qkvz_o + 8090, 4, cudaMemcpyDeviceToHost));
-            strata::kernels::fused_gdn_step_norm_silu(L0.gdn_state, e.qkvz_o, e.qkvz_o + kHk * kS,
+            strata::kernels::fused_gdn_step_norm_silu_q8(L0.gdn_state, e.qkvz_o, e.qkvz_o + kHk * kS,
                                                       e.qkvz_o + 2 * kHk * kS, e.ggate, beta_a,
                                                       e.qkvz_o + kQkv, L0.ssm_norm, e.eps, e.up,
-                                                      e.scratch_up8, kHk, kHv, e.sp);
+                                                      (uint8_t*) e.scratch_up8, kHk, kHv, e.sp);
             CK(cudaStreamSynchronize(e.sp));
             float upA = 0;
             CK(cudaMemcpy(&upA, e.up + probe, 4, cudaMemcpyDeviceToHost));
@@ -2963,15 +2959,14 @@ int main(int argc, char** argv) {
             float vinB = 0, csB = 0;
             CK(cudaMemcpy(&vinB, qkv_b + 8090, 4, cudaMemcpyDeviceToHost));
             CK(cudaMemcpy(&csB, L0.conv_state + 3 * 8090, 4, cudaMemcpyDeviceToHost));
-            strata::kernels::fused_gdn_conv_l2_qk(L0.conv_state, qkv_b, L0.conv_w, qkv_b, kQkv, 2 * kHk, 0,
-                                                  0.0f, e.eps, e.sp);
+            strata::kernels::fused_gdn_conv_l2(L0.conv_state, qkv_b, L0.conv_w, qkv_b, kQkv, 2 * kHk, e.eps, e.sp);
             CK(cudaStreamSynchronize(e.sp));
             float convB = 0;
             CK(cudaMemcpy(&convB, qkv_b + 8090, 4, cudaMemcpyDeviceToHost));
-            strata::kernels::fused_gdn_step_norm_silu(L0.gdn_state, qkv_b, qkv_b + kHk * kS,
+            strata::kernels::fused_gdn_step_norm_silu_q8(L0.gdn_state, qkv_b, qkv_b + kHk * kS,
                                                       qkv_b + 2 * kHk * kS, e.ggate2, beta_b, z_b,
                                                       L0.ssm_norm, e.eps, e.up2,
-                                                      (char*) e.scratch_up8_2, kHk, kHv, e.sp);
+                                                      (uint8_t*) e.scratch_up8_2, kHk, kHv, e.sp);
             CK(cudaStreamSynchronize(e.sp));
             float upB = 0;
             CK(cudaMemcpy(&upB, e.up2 + probe, 4, cudaMemcpyDeviceToHost));
