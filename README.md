@@ -4,7 +4,8 @@
 
 <p align="center"><b>Fast local decode for Qwen3.5-class hybrid models on AMD RDNA2 — with exact-verify MTP.</b><br>
 76.6 tok/s greedy from a 9B Gated-DeltaNet hybrid on an RX 6950 XT — faster than llama.cpp Vulkan on the same card.<br>
-Built at [Buccaneer Salvage](https://github.com/jollyroger1480) · X [@jollyroger1480](https://x.com/jollyroger1480)</p>
+Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a> · X <a href="https://x.com/jollyroger1480">@jollyroger1480</a><br>
+<b>💵 Cash App: <a href="https://cash.app/$jollyroger1480">$jollyroger1480</a></b></p>
 
 ---
 
@@ -159,10 +160,3 @@ by removing launches and passes, not by breaking physics. Bugs and measurements 
 
 MIT — see [LICENSE](LICENSE). Parts adapted from MIT-licensed Strata/llama.cpp carry their notices
 in the source headers.
-
-## Support the yard
-
-Rapier is free, forever. If it made your GPU faster, a coffee keeps the soldering irons hot:
-
-**💵 Cash App: [$jollyroger1480](https://cash.app/$jollyroger1480)**
-**🐦 X: [@jollyroger1480](https://x.com/jollyroger1480)**
