@@ -13,9 +13,10 @@ Rapier is a single-model HIP decode engine for the **qwen35 architecture** (the 
 Gated-DeltaNet linear-attention layers + GQA every 4th layer + an MTP draft head), built as a program
 and two kernel patches inside a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)
 (the MoE engine for Qwen3.8-Flash-Next — itself built on [llama.cpp/ggml](https://github.com/ggml-org/llama.cpp)).
-Patches are cut against upstream **v0.1.41**; the two RDNA2 fixes rapier contributed upstream
+Patches are cut against upstream **v0.1.44.1**. The two RDNA2 fixes rapier contributed upstream
 (portable `alignas` shared-memory declaration for gfx1030, split-shard architecture guard) shipped
-in 0.1.40, so the port now inherits them instead of carrying them.
+in 0.1.40, and gfx1030 is already on upstream's unvalidated allow-list, so the port does not
+carry either one.
 
 It exists because on RDNA2, a decoder purpose-built for one model beats a general one:
 
@@ -40,10 +41,10 @@ starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07
   both tokens, and a true-prefill path (hipBLAS GEMM, one weight read for T tokens) for ingesting
   long prompts.
 - **`patches/0001-fused-gdn-silu-q8.patch`** — the fused Gated-DeltaNet chain: conv+SiLU+L2(+q-scale),
-  and step+RMS-norm+SiLU with an in-kernel **Q8_1 epilogue** (the next GEMV's input is quantized
-  inside the recurrence kernel), on top of 0.1.40's split-reduction `red_kv`/`red_o` shape. The
-  epilogue quantizes through `q8_1_finite.hpp` (#606) so massive-activation blocks keep a finite
-  d/sum instead of inf·0 = NaN. 9 kernel launches per layer → 3.
+  step+RMS-norm+SiLU with an in-kernel **Q8_1 epilogue** (the next GEMV's input is quantized
+  inside the recurrence kernel), and the qwen35 closing norm `gdn_out_norm_silu` (SiLU, not the
+  qwen4exp sigmoid). The epilogue quantizes through `q8_1_finite.hpp` (#606) so massive-activation
+  blocks keep a finite d/sum instead of inf·0 = NaN. 9 kernel launches per layer → 3.
 - **`patches/0002-mmvq-rows-residual.patch`** — rows-per-block as a template knob for the Q6_K MMVQ,
   **residual-epilogue GEMV variants** that fold the residual add and the next norm's
   sum-of-squares partials into the GEMV itself (deletes 64 kernels/token). The 0.1.39
@@ -85,13 +86,17 @@ You need: an AMD RDNA2 card (tested: RX 6950 XT, gfx1030; ROCm ≥ 6 with HIPCC)
 ```sh
 git clone https://github.com/Niko1221/Strata
 cd Strata
-git checkout v0.1.40.3        # the release these patches are cut against
+git checkout v0.1.44.1        # the release these patches are cut against
 git apply /path/to/rapier/patches/*.patch
 cp /path/to/rapier/src/qwythos.cpp /path/to/rapier/src/qwythos_prefill.cu src/program/
+cp /path/to/rapier/src/test_res.cpp src/
 
-# add the target (or copy the block from the patch notes in docs/BUILD.md):
+# add the targets (or copy the block from the patch notes in docs/BUILD.md):
 cat >> CMakeLists.txt <<'EOF'
 if(STRATA_ENABLE_HIP)
+  add_executable(test_res src/test_res.cpp)
+  set_source_files_properties(src/test_res.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(test_res PRIVATE strata_kernels strata_hip_runtime)
   add_executable(qwythos src/program/qwythos.cpp src/program/qwythos_prefill.cu)
   set_source_files_properties(src/program/qwythos.cpp src/program/qwythos_prefill.cu PROPERTIES LANGUAGE HIP)
   target_link_libraries(qwythos PRIVATE strata_kernels strata_prefill strata_hip_runtime)
