@@ -11,9 +11,9 @@ if(STRATA_ENABLE_HIP)
   add_executable(test_res src/test_res.cpp)
   set_source_files_properties(src/test_res.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(test_res PRIVATE strata_kernels strata_hip_runtime)
-  add_executable(qwythos src/program/qwythos.cpp src/program/qwythos_prefill.cu)
-  set_source_files_properties(src/program/qwythos.cpp src/program/qwythos_prefill.cu PROPERTIES LANGUAGE HIP)
-  target_link_libraries(qwythos PRIVATE strata_kernels strata_prefill strata_hip_runtime)
+  add_executable(qwythos src/program/qwythos.cpp)
+  set_source_files_properties(src/program/qwythos.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(qwythos PRIVATE strata_kernels strata_hip_runtime)
 endif()
 ```
 
@@ -27,7 +27,9 @@ big one: `HIP_VISIBLE_DEVICES=1 ./build-hip/qwythos ...`.
 
 Post-update checks: 0.1.37 → 0.1.40.3 rebase (2026-10-07): 76.6 tok/s, ids bit-identical.
 0.1.40.3 → 0.1.41 (2026-10-08) and → 0.1.42 (2026-10-10) rebases: same invariant,
-batched GEMM prefill now the default (155-157 tok/s @8k ingest, bit-exact A/B via
-QWYTHOS_PF_SEQ=1). 0.1.42 → 0.1.44.1 (2026-10-15): patches recut against that tag.
+batched GEMM prefill was the default then (155-157 tok/s @8k ingest). That figure is
+not the current path: on 2026-10-15 the hipBLAS chunk was removed because its greedy
+ids did not match the per-token path. Long prompts now use the 8-wide Q8 GEMV.
+0.1.42 → 0.1.44.1 (2026-10-15): patches recut against that tag.
 `build-hip/test_res` = synthetic parity harness for the MMVQ
 residual-epilogue kernels (run on a sacrificial card, not your display GPU).

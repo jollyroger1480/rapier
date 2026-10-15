@@ -33,13 +33,12 @@ starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07
 
 ## What's in the box
 
-- **`src/qwythos.cpp`** (~3.0k lines, plus `src/qwythos_prefill.cu`) — the whole decode engine as one
-  program: Q6_K/Q8_0 dp4a GEMVs with a CUDA-graph-captured token, fused rms-norm+Q8_1 quantize,
-  weight-matrix concatenation (qkv‖z, α‖β, up‖gate, wq‖wk‖wv — one GEMV launch per group),
-  residual-add epilogues fused into the GEMVs, a flash-decode-style **parallel attention kernel**
-  (one block per head), a **2-column batched MTP verify pass** that streams the weights once for
-  both tokens, and a true-prefill path (hipBLAS GEMM, one weight read for T tokens) for ingesting
-  long prompts.
+- **`src/qwythos.cpp`** — the whole decode engine as one program: Q6_K/Q8_0 dp4a GEMVs with a
+  CUDA-graph-captured token, fused rms-norm+Q8_1 quantize, weight-matrix concatenation
+  (qkv‖z, α‖β, up‖gate, wq‖wk‖wv — one GEMV launch per group), residual-add epilogues fused
+  into the GEMVs, a flash-decode-style **parallel attention kernel** (one block per head),
+  a **2-column batched MTP verify pass** that streams the weights once for both tokens, and
+  8-wide Q8 GEMV prefill for long prompts (same greedy ids as the per-token path).
 - **`patches/0001-fused-gdn-silu-q8.patch`** — the fused Gated-DeltaNet chain: conv+SiLU+L2(+q-scale),
   step+RMS-norm+SiLU with an in-kernel **Q8_1 epilogue** (the next GEMV's input is quantized
   inside the recurrence kernel), and the qwen35 closing norm `gdn_out_norm_silu` (SiLU, not the
@@ -50,11 +49,6 @@ starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07
   sum-of-squares partials into the GEMV itself (deletes 64 kernels/token). The 0.1.39
   multi-column occupancy bump (minBlocksPerSM 4 for ROWS<=2) is part of upstream since 0.1.40 —
   the patch no longer carries it.
-- **`src/qwythos_prefill.cu`** — the **batched GEMM prefill**: hipBLAS projections over T tokens
-  plus T-token GDN/attention kernels (per-channel conv with the window in registers, the delta-rule
-  step with the whole GDN state in registers across the chunk, flash-decode attention per token ×
-  head). Replaced the per-token ingest loops (~300 launches+syncs per token): **ingestion 84 → 155
-  tok/s at 8k, 53 → 144 at 16k, bit-exact vs the per-token path** (`QWYTHOS_PF_SEQ=1` A/B).
 - **`src/test_res.cpp`** — synthetic parity harness for the MMVQ residual-epilogue kernels
   (bit-exact checks; run on a sacrificial card).
 - **Quantized builds** (see bench/RESULTS.md addenda): the fast-brain GGUF is an
@@ -88,7 +82,7 @@ git clone https://github.com/Niko1221/Strata
 cd Strata
 git checkout v0.1.44.1        # the release these patches are cut against
 git apply /path/to/rapier/patches/*.patch
-cp /path/to/rapier/src/qwythos.cpp /path/to/rapier/src/qwythos_prefill.cu src/program/
+cp /path/to/rapier/src/qwythos.cpp src/program/
 cp /path/to/rapier/src/test_res.cpp src/
 
 # add the targets (or copy the block from the patch notes in docs/BUILD.md):
@@ -97,9 +91,9 @@ if(STRATA_ENABLE_HIP)
   add_executable(test_res src/test_res.cpp)
   set_source_files_properties(src/test_res.cpp PROPERTIES LANGUAGE HIP)
   target_link_libraries(test_res PRIVATE strata_kernels strata_hip_runtime)
-  add_executable(qwythos src/program/qwythos.cpp src/program/qwythos_prefill.cu)
-  set_source_files_properties(src/program/qwythos.cpp src/program/qwythos_prefill.cu PROPERTIES LANGUAGE HIP)
-  target_link_libraries(qwythos PRIVATE strata_kernels strata_prefill strata_hip_runtime)
+  add_executable(qwythos src/program/qwythos.cpp)
+  set_source_files_properties(src/program/qwythos.cpp PROPERTIES LANGUAGE HIP)
+  target_link_libraries(qwythos PRIVATE strata_kernels strata_hip_runtime)
 endif()
 EOF
 
@@ -132,11 +126,10 @@ tokenizer, ChatML template, temperature/top-p sampling, and an incremental conve
 Measured on the RX 6950 XT (2026-10-07 retest, 0.1.40.3 base, ROCm 10.1) through the full HTTP
 stack: **75.9 tok/s greedy-MTP** (GPU argmax, no logits round-trip; 76.6 tok/s engine CLI),
 ~46 tok/s sampled. **64K context** (caches preallocated at load), SSE streaming with
-`reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion is the
-**batched GEMM prefill** (hipBLAS projections + T-token GDN/attention kernels, default
-since the v0.1.41 rebase): **~150 tok/s at 2–8k prompts, 144 at 16k** — the old chunked
-path (86 @8k, 54 @16k) stays reachable with `QWYTHOS_NOGEMM=1`. Later turns ingest only
-the new tokens.
+`reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion uses the
+same 8-wide Q8 GEMV as a short prompt, so greedy ids match the per-token path. The
+hipBLAS GEMM chunk (the old ~150 tok/s @8k figure) was removed on 2026-10-15: those
+ids did not match. Later turns ingest only the new tokens.
 
 ```sh
 HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible
