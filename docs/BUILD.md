@@ -29,7 +29,8 @@ Post-update checks: 0.1.37 → 0.1.40.3 rebase (2026-10-07): 76.6 tok/s, ids bit
 0.1.40.3 → 0.1.41 (2026-10-08) and → 0.1.42 (2026-10-10) rebases: same invariant,
 batched GEMM prefill was the default then (155-157 tok/s @8k ingest). That figure is
 not the current path: on 2026-10-15 the hipBLAS chunk was removed because its greedy
-ids did not match the per-token path. Long prompts now use the 8-wide Q8 GEMV.
+ids did not match the per-token path. Long prompts use the 8-wide Q8 GEMV,
+with that chunk's K scores read once (`QWYTHOS_BN=16` is the same ids).
 0.1.42 → 0.1.44.1 (2026-10-15): patches recut against that tag.
 `build-hip/test_res` = synthetic parity harness for the MMVQ
 residual-epilogue kernels (run on a sacrificial card, not your display GPU).

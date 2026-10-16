@@ -1,0 +1,62 @@
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 06ce9f45..1c602307 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -825,7 +825,7 @@ __global__ void native_small_mmvq_kernel(const Weight* __restrict__ w,
+ // row) value is accumulated over kbx in the same order, summed across warps in the same order and reduced with
+ // the same warp tree as the ncols = 1 kernel, so every column is BITWISE equal to a single-column call on that
+ // column (checked by bench/micro/native_mmvq_multi.cpp). The ncols = 1 kernels are untouched.
+-constexpr int MAX_NCOLS = 8;
++constexpr int MAX_NCOLS = 16;
+ 
+ // Each format splits its dot product into `load` (everything that depends only on the weight block: codes,
+ // unpacked scales, block scale) and `apply` (the activation loads and the original *_impl expression). `load` runs
+@@ -1304,7 +1304,8 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
+         case 6: launch_multi_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
+         case 7: launch_multi_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
+         case 8: launch_multi_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
+-        default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8");
++        case 16: launch_multi_n<F, 16>(weights, x_q8_1, y, n_in, n_out, s); break;
++        default: throw std::invalid_argument("native MMVQ multi-column launch requires 2 <= ncols <= 8, or 16");
+     }
+ }
+ 
+@@ -1509,7 +1510,7 @@ void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
+     if (n_in <= 0 || n_in % block_elems != 0) {
+         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
+     }
+-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
++    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 16");
+ }
+ void validate_pointer(const void* p) {
+     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
+@@ -1588,7 +1589,8 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
+         case 6: wave_launch_n<F, 6>(weights, x_q8_1, y, n_in, n_out, s); break;
+         case 7: wave_launch_n<F, 7>(weights, x_q8_1, y, n_in, n_out, s); break;
+         case 8: wave_launch_n<F, 8>(weights, x_q8_1, y, n_in, n_out, s); break;
+-        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
++        case 16: wave_launch_n<F, 16>(weights, x_q8_1, y, n_in, n_out, s); break;
++        default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8, or 16");
+     }
+ }
+ #define STRATA_WAVE_MMVQ(...) \
+@@ -1758,7 +1760,8 @@ bool q8_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
+         case 6: q8_packed_launch<6>(found->second, x, y, s); break;
+         case 7: q8_packed_launch<7>(found->second, x, y, s); break;
+         case 8: q8_packed_launch<8>(found->second, x, y, s); break;
+-        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
++        case 16: q8_packed_launch<16>(found->second, x, y, s); break;
++        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8, or 16");
+     }
+     launch_check();
+     return true;
+@@ -1893,7 +1896,8 @@ bool q6_packed_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in,
+         case 6: q6_packed_launch<6>(found->second, x, y, s); break;
+         case 7: q6_packed_launch<7>(found->second, x, y, s); break;
+         case 8: q6_packed_launch<8>(found->second, x, y, s); break;
+-        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
++        case 16: q6_packed_launch<16>(found->second, x, y, s); break;
++        default: throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8, or 16");
+     }
+     launch_check();
+     return true;

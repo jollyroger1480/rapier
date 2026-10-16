@@ -38,7 +38,8 @@ starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07
   (qkv‖z, α‖β, up‖gate, wq‖wk‖wv — one GEMV launch per group), residual-add epilogues fused
   into the GEMVs, a flash-decode-style **parallel attention kernel** (one block per head),
   a **2-column batched MTP verify pass** that streams the weights once for both tokens, and
-  8-wide Q8 GEMV prefill for long prompts (same greedy ids as the per-token path).
+  8-wide Q8 GEMV prefill (16-wide is `QWYTHOS_BN=16`, same ids) and a shared-K
+  attention score for the chunk. Greedy ids match the per-token path.
 - **`patches/0001-fused-gdn-silu-q8.patch`** — the fused Gated-DeltaNet chain: conv+SiLU+L2(+q-scale),
   step+RMS-norm+SiLU with an in-kernel **Q8_1 epilogue** (the next GEMV's input is quantized
   inside the recurrence kernel), and the qwen35 closing norm `gdn_out_norm_silu` (SiLU, not the
@@ -127,9 +128,14 @@ Measured on the RX 6950 XT (2026-10-07 retest, 0.1.40.3 base, ROCm 10.1) through
 stack: **75.9 tok/s greedy-MTP** (GPU argmax, no logits round-trip; 76.6 tok/s engine CLI),
 ~46 tok/s sampled. **64K context** (caches preallocated at load), SSE streaming with
 `reasoning_content` deltas, and OpenAI **tool calling** end to end. Ingestion uses the
-same 8-wide Q8 GEMV as a short prompt, so greedy ids match the per-token path. The
-hipBLAS GEMM chunk (the old ~150 tok/s @8k figure) was removed on 2026-10-15: those
-ids did not match. Later turns ingest only the new tokens.
+8-wide Q8 GEMV (the K scores for that chunk are read once) so greedy ids match the
+per-token path. `QWYTHOS_BN=16` is the same math and was not faster on this card.
+The hipBLAS GEMM chunk (the old ~150 tok/s @8k figure) was removed on 2026-10-15:
+those ids did not match. Later turns ingest only the new tokens. A same-prompt
+retest on 2026-10-15 (RX 6950 XT, Q6_K, repeated France prompt): 2k ingest
+162 tok/s vs 146 with the old per-token attention, 8k ingest 94 vs 76. Decode on
+this binary, 400 greedy MTP tokens, 94.1 tok/s with 191/207 draft steps accepted.
+That decode figure is a new measurement, not a claim that attention changed it.
 
 ```sh
 HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible

@@ -45,7 +45,7 @@ constexpr int kMaxCtx = 65536;  // 64K: Hermes Agent minimum; KV cost ~2.4 GB VR
 // set at parse time (--serve); silences stdout chatter that would corrupt the JSON protocol
 static bool g_serve_mode = false;
 static bool cur_dev_valid = false;  // serve: d_logits holds the last token's logits
-constexpr int BATCH = 8;            // prefill chunk width
+constexpr int BATCH = 8;            // prefill chunk width. 16 is legal (QWYTHOS_BN) and bit-exact; 8 won the timed runs.
 
 constexpr float kInvSqrtS = 0.0883883476f; // 1/sqrt(128)
 constexpr float kAttnScale = 0.0625f;      // 1/sqrt(256)
@@ -172,6 +172,7 @@ struct Engine {
     float* ggate = nullptr;
     float* logits = nullptr;
     float* ascores = nullptr;
+    float* ascores_b = nullptr;   // 8 columns * kHeads * kMaxCtx, chunk-attention scores
     float* hlogits = nullptr;
     float* hrow = nullptr;
     float* qkvz_o = nullptr;   // qkv‖z GEMV output (12288)
@@ -403,6 +404,123 @@ __global__ void __launch_bounds__(256) gqa_head_kernel(const float* __restrict__
         if (tid < tn) ps[tid] = sc[t0 + tid];
         __syncthreads();
         for (int t = 0; t < tn; ++t) acc += ps[t] * vbase[(size_t)(t0 + t) * n_kv * hd];
+        __syncthreads();
+    }
+    o[(size_t) h * hd + tid] = acc * inv;
+}
+
+// Score half of gqa_head_kernel for a whole ingest chunk. One block owns one KV head.
+// Each warp owns one query column and dots it against a K tile in LDS, so the chunk
+// reads K once. The dot is the same 32-lane sum as gqa_head_kernel. Softmax and V
+// stay in gqa_from_scores_kernel, which is that kernel's second half unchanged.
+// Scores land at ((column * kHeads + head) * kMaxCtx + token).
+__global__ void __launch_bounds__(256) gqa_score_chunk_kernel(const float* __restrict__ q,
+                                                              const float* __restrict__ kc,
+                                                              float* __restrict__ scores,
+                                                              const int* __restrict__ meta, int B, float scale) {
+    constexpr int TILE = 32;
+    constexpr int GQA = kHeads / kKv;
+    constexpr int HD = kHd;
+    __shared__ float Ks[TILE][HD];
+    __shared__ int spos[8];
+    const int kv = (int) blockIdx.x;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int tid = (int) threadIdx.x;
+    if (lane == 0) spos[warp] = (warp < B) ? meta[warp] : -1;
+    __syncthreads();
+    int maxpos = spos[0];
+#pragma unroll
+    for (int i = 1; i < 8; ++i) if (spos[i] > maxpos) maxpos = spos[i];
+    const int n_tok = maxpos + 1;
+    const int c = warp;
+    const int pos = (c < B) ? spos[c] : -1;
+    float qreg[GQA][HD / 32];
+    if (c < B) {
+#pragma unroll
+        for (int qh = 0; qh < GQA; ++qh) {
+            const int h = kv * GQA + qh;
+            const float* qq = q + (size_t) c * kEmb + (size_t) h * HD;
+#pragma unroll
+            for (int di = 0; di < HD / 32; ++di) qreg[qh][di] = qq[lane + di * 32];
+        }
+    }
+    for (int t0 = 0; t0 < n_tok; t0 += TILE) {
+        const int tn = min(TILE, n_tok - t0);
+        for (int i = tid; i < tn * HD; i += 256) {
+            const int t = i / HD;
+            const int d = i - t * HD;
+            Ks[t][d] = kc[((size_t) (t0 + t) * kKv + kv) * HD + d];
+        }
+        __syncthreads();
+        if (c < B) {
+#pragma unroll
+            for (int qh = 0; qh < GQA; ++qh) {
+                const int h = kv * GQA + qh;
+                float* sc = scores + ((size_t) c * kHeads + h) * kMaxCtx;
+                for (int t = 0; t < tn; ++t) {
+                    const int tok = t0 + t;
+                    if (tok > pos) continue;
+                    float dot = 0.0f;
+#pragma unroll
+                    for (int di = 0; di < HD / 32; ++di) dot += qreg[qh][di] * Ks[t][lane + di * 32];
+#pragma unroll
+                    for (int off = 16; off > 0; off >>= 1)
+                        dot += __shfl_xor_sync(0xffffffff, dot, off);
+                    if (lane == 0) sc[tok] = dot * scale;
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+// gqa_head_kernel's softmax and V, reading scores already written at head * kMaxCtx.
+__global__ void __launch_bounds__(256) gqa_from_scores_kernel(const float* __restrict__ scores,
+                                                              const float* __restrict__ vc, float* __restrict__ o,
+                                                              int n_head, int n_kv, int hd, const int* __restrict__ meta) {
+    __shared__ float red[8];
+    __shared__ float ps[256];
+    __shared__ int ntoks;
+    const int h = blockIdx.x;
+    const int kv = h / (n_head / n_kv);
+    const int tid = threadIdx.x;
+    const int lane = tid & 31, warp = tid >> 5;
+    if (tid == 0) ntoks = meta[0] + 1;
+    __syncthreads();
+    const int n_tok = ntoks;
+    const float* sc = scores + (size_t) h * kMaxCtx;
+
+    float m = -1e30f;
+    for (int t = tid; t < n_tok; t += 256) m = fmaxf(m, sc[t]);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, off));
+    if (lane == 0) red[warp] = m;
+    __syncthreads();
+    const float gmax = fmaxf(fmaxf(fmaxf(red[0], red[1]), fmaxf(red[2], red[3])),
+                             fmaxf(fmaxf(red[4], red[5]), fmaxf(red[6], red[7])));
+    float s = 0.0f;
+    for (int t = tid; t < n_tok; t += 256) {
+        const float e = expf(sc[t] - gmax);
+        s += e;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffff, s, off);
+    if (lane == 0) red[warp] = s;
+    __syncthreads();
+    const float gsum = red[0] + red[1] + red[2] + red[3] + red[4] + red[5] + red[6] + red[7];
+    const float inv = 1.0f / gsum;
+
+    float acc = 0.0f;
+    const float* vbase = vc + (size_t) kv * hd + tid;
+    for (int t0 = 0; t0 < n_tok; t0 += 256) {
+        const int tn = min(256, n_tok - t0);
+        if (tid < tn) {
+            const float e = expf(sc[t0 + tid] - gmax);
+            ps[tid] = e;
+        }
+        __syncthreads();
+        for (int t = 0; t < tn; ++t) acc += ps[t] * vbase[(size_t) (t0 + t) * n_kv * hd];
         __syncthreads();
     }
     o[(size_t) h * hd + tid] = acc * inv;
@@ -1108,7 +1226,7 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
     else if (type == 12) strata::kernels::native_q4_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else {
-        std::fprintf(stderr, "bad gemv2 type %d\n", type);
+        std::fprintf(stderr, "bad gemv2 type %d in %d out %d\n", type, n_in, n_out);
         std::exit(1);
     }
 }
@@ -1646,7 +1764,7 @@ void alloc_primary(Engine& e) {
     CK(cudaMalloc(&e.q3_o2, (size_t) 2 * (2 * kHeads * kHd + 2 * kKv * kHd) * 4));
     CK(cudaMalloc(&e.up2, (size_t) 2 * kEmb * 4));
     CK(cudaMalloc(&e.z2, (size_t) 2 * kEmb * 4));
-    CK(cudaMalloc(&e.ggate2, (size_t) 8 * kHv * 4));  // B=8 batch columns (was 2 — verify-only; batch wrote past it)
+    CK(cudaMalloc(&e.ggate2, (size_t) 16 * kHv * 4));  // ingest chunk is 16 columns; verify uses the first 2
     CK(cudaMalloc(&e.partials2, (size_t) 2 * (kEmb / 4) * 4));
     CK(cudaMalloc(&e.scratch_p2, (size_t) 2 * q8));
     CK(cudaMalloc(&e.scratch_up8_2, (size_t) 2 * kEmb / 32 * 36));
@@ -1688,8 +1806,8 @@ void alloc_primary(Engine& e) {
     CK(cudaMalloc(&e.dmeta1, sizeof(int)));
     CK(cudaMallocHost(&e.hmeta1, sizeof(int)));
     CK(cudaMallocHost(&e.hlogits2, (size_t) 2 * kVocab * 4));
-    // batched prefill buffers (B=8)
-    constexpr int KB = 8;
+    // batched prefill buffers (B=16)
+    constexpr int KB = 16;
     CK(cudaMalloc(&e.xb, (size_t) KB * kEmb * 4));
     CK(cudaMalloc(&e.ob, (size_t) KB * kEmb * 4));
     CK(cudaMalloc(&e.upb, (size_t) KB * kEmb * 4));
@@ -1719,6 +1837,7 @@ void alloc_primary(Engine& e) {
     CK(cudaMalloc(&e.ggate, (size_t) kHv * 4));
     CK(cudaMalloc(&e.logits, (size_t) kVocab * 4));
     CK(cudaMalloc(&e.ascores, (size_t) kHeads * kMaxCtx * 4));
+    CK(cudaMalloc(&e.ascores_b, (size_t) 8 * kHeads * kMaxCtx * 4));
     CK(cudaMalloc(&e.dpos, sizeof(int) * kHeads));
     CK(cudaMalloc(&e.dmeta, sizeof(int)));
     CK(cudaMallocHost(&e.hrow, (size_t) kEmb * 4));
@@ -1931,10 +2050,10 @@ void load_model(Engine& e, const strata::GgufFile& file) {
 
 // ============================ batched prefill (serve) ============================
 //
-// Ingests B tokens (B = 2..8) per weight read: each projection group rides one
+// Ingests B tokens (B = 16, or 2..8) per weight read: each projection group rides one
 // multi-column GEMV (bitwise-equal per column to a single-column call), the GDN
-// recurrence stays sequential per token (cheap), attention stays per-token against
-// the KV cache with per-token positions.  Mirrors the 2-col verify pass exactly.
+// recurrence stays sequential per token, and the attention layers share one KV
+// read across the chunk.  Mirrors the 2-col verify pass exactly.
 
 // kernels-only body: reads e.xb (already staged) and e.dmeta_b (positions).  Graph-capturable:
 // no syncs, no host-dependent branching, fixed buffer addresses.
@@ -2025,10 +2144,28 @@ static void serve_ingest_kernels(Engine& e, int B) {
                 store_kv2_kernel<<<(2 * kv_n + 255) / 256, 256, 0, e.sp>>>(L.kcache, L.vcache, k_c, v_c,
                                                                            meta_c, kv_n);
                 ck_launch("bp store_kv");
-                gqa_head_kernel<<<kHeads, 256, 0, e.sp>>>(e.ob + (size_t) c * kEmb, L.kcache, L.vcache,
-                                                          e.upb + (size_t) c * kEmb, e.ascores, kHeads, kKv,
-                                                          kHd, meta_c, kAttnScale);
-                ck_launch("bp gqa");
+            }
+            static const bool attn_old = std::getenv("QWYTHOS_ATTNOLD") != nullptr;
+            if (attn_old || B <= 1) {
+                for (int c = 0; c < B; ++c)
+                    gqa_head_kernel<<<kHeads, 256, 0, e.sp>>>(e.ob + (size_t) c * kEmb, L.kcache, L.vcache,
+                                                              e.upb + (size_t) c * kEmb, e.ascores, kHeads, kKv,
+                                                              kHd, e.dmeta_b + c, kAttnScale);
+            } else {
+                for (int c0 = 0; c0 < B; c0 += 8) {
+                    const int nq = std::min(8, B - c0);
+                    gqa_score_chunk_kernel<<<kKv, 256, 0, e.sp>>>(e.ob + (size_t) c0 * kEmb, L.kcache,
+                                                                  e.ascores_b, e.dmeta_b + c0, nq, kAttnScale);
+                    ck_launch("bp gqa score");
+                    for (int c = 0; c < nq; ++c)
+                        gqa_from_scores_kernel<<<kHeads, 256, 0, e.sp>>>(
+                            e.ascores_b + (size_t) c * kHeads * kMaxCtx, L.vcache,
+                            e.upb + (size_t) (c0 + c) * kEmb, kHeads, kKv, kHd,
+                            e.dmeta_b + c0 + c);
+                }
+            }
+            ck_launch("bp gqa");
+            for (int c = 0; c < B; ++c) {
                 sig_mul_quant_kernel<<<kEmb / 256, 256, 0, e.sp>>>(
                     e.upb + (size_t) c * kEmb, e.zb + (size_t) c * kEmb,
                     reinterpret_cast<Q81Row*>((char*) e.scratch_up8_b + c * q8e), kEmb);
@@ -2223,16 +2360,20 @@ static void serve_loop(Engine& e) {
             int i = 0;
             bool used_batch = false;
             static const bool nobatch = std::getenv("QWYTHOS_NOBATCH") != nullptr;
-            // batch size: 2/4/7/8 via QWYTHOS_BN (default 8); the graph is only valid for its
-            // captured width, so eager kernels run when the width differs
-            static const int bn = [] { const char* v = std::getenv("QWYTHOS_BN"); return v ? std::atoi(v) : 8; }();
+            // batch size: 2..8 or 16 via QWYTHOS_BN (default 8). The captured graph is
+            // width 8 only, so any other width runs the eager kernels.
+            static const int bn = [] {
+                const char* v = std::getenv("QWYTHOS_BN");
+                const int n = v ? std::atoi(v) : BATCH;
+                return (n == 16 || (n >= 2 && n <= 8)) ? n : BATCH;
+            }();
             // Long prompts use the same 8-wide Q8 GEMV as short ones. The fp16 GEMM
             // chunk did not match those ids (SwiGLU was re-normalized, and the GEMM
             // itself is not the Q8 matvec decode uses).
             if (!nobatch) {
             if (!e.batch_graph && !e.split && bn == 8 && !std::getenv("QWYTHOS_ATRACE")) capture_batch_graph(e);
             while (toks.size() - i >= (size_t) bn) {
-                if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 8 * kEmb * 4));
+                if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 16 * kEmb * 4));
                 for (int c = 0; c < bn; ++c) {
                     const uint8_t* src = e.emb_host + (size_t) toks[(size_t) (i + c)] * e.emb_stride;
                     for (int b = 0; b < kEmb / 256; ++b)
@@ -2459,7 +2600,33 @@ int main(int argc, char** argv) {
         capture_graph(e);
         std::vector<int> seq = tokens;
         int prompt = (int) tokens.size();
-        for (int i = 0; i < prompt - 1; ++i) forward_token(e, seq[(size_t) i], i);
+        {
+            static const bool nobatch = std::getenv("QWYTHOS_NOBATCH") != nullptr;
+            static const int bn = [] {
+                const char* v = std::getenv("QWYTHOS_BN");
+                const int n = v ? std::atoi(v) : BATCH;
+                return (n == 16 || (n >= 2 && n <= 8)) ? n : BATCH;
+            }();
+            int i = 0;
+            const int npre = prompt > 0 ? prompt - 1 : 0;
+            if (!nobatch && e.split <= 0.0f) {
+                while (npre - i >= bn) {
+                    if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 16 * kEmb * 4));
+                    for (int c = 0; c < bn; ++c) {
+                        const uint8_t* src = e.emb_host + (size_t) seq[(size_t) (i + c)] * e.emb_stride;
+                        for (int b = 0; b < kEmb / 256; ++b)
+                            emb_dequant_block(e.emb_type, src, b, e.stage_b + (size_t) c * kEmb);
+                    }
+                    for (int c = 0; c < bn; ++c) e.hmeta_b[c] = i + c;
+                    CK(cudaMemcpyAsync(e.xb, e.stage_b, (size_t) bn * kEmb * 4, cudaMemcpyHostToDevice, e.sp));
+                    CK(cudaMemcpyAsync(e.dmeta_b, e.hmeta_b, bn * 4, cudaMemcpyHostToDevice, e.sp));
+                    serve_ingest_kernels(e, bn);
+                    CK(cudaStreamSynchronize(e.sp));
+                    i += bn;
+                }
+            }
+            for (; i < npre; ++i) forward_token(e, seq[(size_t) i], i);
+        }
         auto t2 = std::chrono::steady_clock::now();
         int cur = seq.back();
         int pos = prompt - 1;
