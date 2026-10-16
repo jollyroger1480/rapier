@@ -1161,9 +1161,10 @@ void forward_attn(Engine& e, Layer& L) {
         project(e, e.x, L.attn_norm, ms, ys, 3);
     }
     float* qg = L.cat_qkv3 ? e.q3_o : e.qkv;
-    // wq emits 2*heads*hd (q and the output gate, per-head interleaved); k and v follow it.
+    // wq emits 2*heads*hd (q and the output gate). Fused qkv keeps k then v after that.
+    // Mixed quant leaves k and v in their own buffers; v is not k + kv_n.
     float* k_v = L.cat_qkv3 ? e.q3_o + 2 * kHeads * kHd : e.k;
-    float* v_v = k_v + kKv * kHd;
+    float* v_v = L.cat_qkv3 ? k_v + kKv * kHd : e.v;
     seg_open(e, 'H');
     split_qg_kernel<<<kHeads, kHd, 0, e.sp>>>(qg, e.o, e.z, kHeads, kHd);
     ck_launch("split_qg");
@@ -1231,6 +1232,33 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
     }
 }
 
+// A fused group (qkv‖z, β‖α, up‖gate, q‖k‖v) is one GEMV only when every part
+// has the same quant type. Q5_K_M keeps some of those parts at Q6_K, try_cat
+// leaves the fused Mat at type 0, and launching that is an empty-buffer fault
+// on the display GPU. Same-type files take the fused launch unchanged.
+void mm_q2_group(int nc, bool fused, const Mat& fused_m, const Mat* parts, int nparts,
+                 const void* xq8, size_t xstride, float* y, int ystride, cudaStream_t st) {
+    if (fused) {
+        mm_q2(nc, fused_m.type, fused_m.a, xq8, y, fused_m.n_in, fused_m.n_out, st);
+        return;
+    }
+    int span = 0;
+    for (int p = 0; p < nparts; ++p) span += parts[p].n_out;
+    if (span != ystride || parts[0].a == nullptr) {
+        std::fprintf(stderr, "bad gemv group span %d stride %d type %d\n", span, ystride, parts[0].type);
+        std::exit(1);
+    }
+    for (int c = 0; c < nc; ++c) {
+        const void* x = static_cast<const char*>(xq8) + (size_t) c * xstride;
+        float* dst = y + (size_t) c * ystride;
+        int off = 0;
+        for (int p = 0; p < nparts; ++p) {
+            mm_q(parts[p].type, parts[p].a, x, dst + off, parts[p].n_in, parts[p].n_out, st);
+            off += parts[p].n_out;
+        }
+    }
+}
+
 // One draft step: predict the token AFTER next_tok (the token at pos) from the trunk hidden h_prev (hidden
 // at pos, with its sum-of-squares partials h_partials) and the embedding of next_tok.  Runs blk.32 - an
 // attention-type layer with its own KV cache - at position pos+1 and returns the drafted token id (greedy
@@ -1270,7 +1298,7 @@ int draft_predict(Engine& e, int next_tok, int pos, const float* h_prev, const f
     }
     float* qg = D.cat_qkv3 ? e.q3_o : e.qkv;
     float* k_v = D.cat_qkv3 ? e.q3_o + 2 * kHeads * kHd : e.k;
-    float* v_v = k_v + kKv * kHd;
+    float* v_v = D.cat_qkv3 ? k_v + kKv * kHd : e.v;
     split_qg_kernel<<<kHeads, kHd, 0, e.sp>>>(qg, e.o, e.z, kHeads, kHd);
     ck_launch("draft split_qg");
     rms(e, e.o, D.qn, kHeads, kHd);
@@ -1365,8 +1393,12 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify rms");
-            mm_q2(2, L.qkvz.type, L.qkvz.a, e.scratch_p2, e.qkvz_o2, L.qkvz.n_in, L.qkvz.n_out, e.sp);
-            mm_q2(2, L.ab.type, L.ab.a, e.scratch_p2, e.ab_o2, L.ab.n_in, L.ab.n_out, e.sp);
+            {
+                const Mat qkvz_p[2] = {L.qkv, L.z_w};
+                const Mat ab_p[2] = {L.beta_w, L.alpha_w};
+                mm_q2_group(2, L.cat_qkvz, L.qkvz, qkvz_p, 2, e.scratch_p2, q8e, e.qkvz_o2, kQkv + kEmb, e.sp);
+                mm_q2_group(2, L.cat_ab, L.ab, ab_p, 2, e.scratch_p2, q8e, e.ab_o2, 2 * kHv, e.sp);
+            }
             static const int vskip1 = std::getenv("QWYTHOS_VSKIP1") ? std::atoi(std::getenv("QWYTHOS_VSKIP1")) : 0;
             for (int c = 0; c < 2; ++c) {
                 if (c == 1 && vskip1) break;
@@ -1414,7 +1446,10 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify ffn rms");
-            mm_q2(2, L.upgate.type, L.upgate.a, e.scratch_p2, e.ug_o2, L.upgate.n_in, L.upgate.n_out, e.sp);
+            {
+                const Mat ug_p[2] = {L.up, L.gate};
+                mm_q2_group(2, L.cat_upgate, L.upgate, ug_p, 2, e.scratch_p2, q8e, e.ug_o2, 2 * kFF, e.sp);
+            }
             for (int c = 0; c < 2; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_o2 + (size_t) c * 2 * kFF, e.ug_o2 + (size_t) c * 2 * kFF + kFF,
@@ -1433,7 +1468,11 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify rms");
-            mm_q2(2, L.qkv3.type, L.qkv3.a, e.scratch_p2, e.q3_o2, L.qkv3.n_in, L.qkv3.n_out, e.sp);
+            {
+                const Mat q3_p[3] = {L.wq, L.wk, L.wv};
+                mm_q2_group(2, L.cat_qkv3, L.qkv3, q3_p, 3, e.scratch_p2, q8e, e.q3_o2,
+                            2 * kHeads * kHd + 2 * kKv * kHd, e.sp);
+            }
             for (int c = 0; c < 2; ++c) {
                 const int* meta_c = c ? e.dmeta1 : e.dmeta;
                 float* qg = e.q3_o2 + (size_t) c * (2 * kHeads * kHd + 2 * kKv * kHd);
@@ -1477,7 +1516,10 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                              reinterpret_cast<Q81Row*>((char*) e.scratch_p2 + c * q8e),
                                                              kEmb, e.eps);
             ck_launch("verify ffn rms");
-            mm_q2(2, L.upgate.type, L.upgate.a, e.scratch_p2, e.ug_o2, L.upgate.n_in, L.upgate.n_out, e.sp);
+            {
+                const Mat ug_p[2] = {L.up, L.gate};
+                mm_q2_group(2, L.cat_upgate, L.upgate, ug_p, 2, e.scratch_p2, q8e, e.ug_o2, 2 * kFF, e.sp);
+            }
             for (int c = 0; c < 2; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_o2 + (size_t) c * 2 * kFF, e.ug_o2 + (size_t) c * 2 * kFF + kFF,
@@ -2074,8 +2116,12 @@ static void serve_ingest_kernels(Engine& e, int B) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp rms");
-            mm_q2(B, L.qkvz.type, L.qkvz.a, e.scratch_pb, e.qkvz_ob, L.qkvz.n_in, L.qkvz.n_out, e.sp);
-            mm_q2(B, L.ab.type, L.ab.a, e.scratch_pb, e.ab_ob, L.ab.n_in, L.ab.n_out, e.sp);
+            {
+                const Mat qkvz_p[2] = {L.qkv, L.z_w};
+                const Mat ab_p[2] = {L.beta_w, L.alpha_w};
+                mm_q2_group(B, L.cat_qkvz, L.qkvz, qkvz_p, 2, e.scratch_pb, q8e, e.qkvz_ob, kQkv + kEmb, e.sp);
+                mm_q2_group(B, L.cat_ab, L.ab, ab_p, 2, e.scratch_pb, q8e, e.ab_ob, 2 * kHv, e.sp);
+            }
             for (int c = 0; c < B; ++c) {
                 float* beta_c = e.ab_ob + (size_t) c * 2 * kHv;
                 float* alpha_c = beta_c + kHv;
@@ -2104,7 +2150,10 @@ static void serve_ingest_kernels(Engine& e, int B) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp ffn rms");
-            mm_q2(B, L.upgate.type, L.upgate.a, e.scratch_pb, e.ug_ob, L.upgate.n_in, L.upgate.n_out, e.sp);
+            {
+                const Mat ug_p[2] = {L.up, L.gate};
+                mm_q2_group(B, L.cat_upgate, L.upgate, ug_p, 2, e.scratch_pb, q8e, e.ug_ob, 2 * kFF, e.sp);
+            }
             for (int c = 0; c < B; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_ob + (size_t) c * 2 * kFF, e.ug_ob + (size_t) c * 2 * kFF + kFF,
@@ -2123,7 +2172,11 @@ static void serve_ingest_kernels(Engine& e, int B) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp rms");
-            mm_q2(B, L.qkv3.type, L.qkv3.a, e.scratch_pb, e.q3_ob, L.qkv3.n_in, L.qkv3.n_out, e.sp);
+            {
+                const Mat q3_p[3] = {L.wq, L.wk, L.wv};
+                mm_q2_group(B, L.cat_qkv3, L.qkv3, q3_p, 3, e.scratch_pb, q8e, e.q3_ob,
+                            2 * kHeads * kHd + 2 * kKv * kHd, e.sp);
+            }
             constexpr int kv_n = kKv * kHd;
             for (int c = 0; c < B; ++c) {
                 const int* meta_c = e.dmeta_b + c;
@@ -2183,7 +2236,10 @@ static void serve_ingest_kernels(Engine& e, int B) {
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp ffn rms");
-            mm_q2(B, L.upgate.type, L.upgate.a, e.scratch_pb, e.ug_ob, L.upgate.n_in, L.upgate.n_out, e.sp);
+            {
+                const Mat ug_p[2] = {L.up, L.gate};
+                mm_q2_group(B, L.cat_upgate, L.upgate, ug_p, 2, e.scratch_pb, q8e, e.ug_ob, 2 * kFF, e.sp);
+            }
             for (int c = 0; c < B; ++c)
                 swiglu_quant_kernel<<<kFF / 256, 256, 0, e.sp>>>(
                     e.ug_ob + (size_t) c * 2 * kFF, e.ug_ob + (size_t) c * 2 * kFF + kFF,
@@ -2597,7 +2653,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         probe_gemv(e);
-        capture_graph(e);
+        if (!std::getenv("QWYTHOS_NOGRAPH")) capture_graph(e);
         std::vector<int> seq = tokens;
         int prompt = (int) tokens.size();
         {
