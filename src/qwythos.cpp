@@ -19,6 +19,7 @@ using strata::kernels::q8_1_ds;
 #include <iostream>
 #include <cmath>
 #include <cstdint>
+#include <chrono>
 #include <cstdio>
 #include <csignal>
 #include <cstdlib>
@@ -271,6 +272,22 @@ void ck_launch(const char* what) {
         std::exit(1);
     }
 }
+
+// QWYTHOS_INGEST_TRACE=1: accumulate GPU ms per named launch group across one ingest
+// op and dump the table when the op's last token lands (serve_loop prints it).
+struct IngestTrace {
+    bool on = false;
+    cudaEvent_t a = nullptr, b = nullptr;
+    std::map<std::string, float> ms;
+    float total = 0.0f;
+    void begin() {
+        on = std::getenv("QWYTHOS_INGEST_TRACE") != nullptr;
+        if (!on) return;
+        if (!a) { CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b)); }
+    }
+    void mark(cudaEvent_t ev) { if (on) CK(cudaEventRecord(ev, 0)); }
+};
+static IngestTrace g_itrace;
 
 __global__ void swiglu_kernel(float* gate, const float* up, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1411,6 +1428,11 @@ void launch_token_verify(Engine& e, int tokA, int tokB, int posA) {
                                                      e.ggate2 + (size_t) c * kHv, kHv);
                 ck_launch("verify beta_gate");
                 strata::kernels::fused_gdn_conv_l2(L.conv_state, qkv_c, L.conv_w, qkv_c, kQkv, 2 * kHk, e.eps, e.sp);
+                if (false) {
+                    float h[4];
+                    CK(cudaMemcpy(h, qkv_c, 16, cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr, "idump L0conv %.6f %.6f %.6f %.6f\n", h[0], h[1], h[2], h[3]);
+                }
                 strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv_c, qkv_c + kHk * kS, qkv_c + 2 * kHk * kS,
                                                           e.ggate2 + (size_t) c * kHv, beta_v, z_c,
                                                           L.ssm_norm, e.eps, e.up2 + (size_t) c * kEmb,
@@ -2099,23 +2121,112 @@ void load_model(Engine& e, const strata::GgufFile& file) {
 
 // kernels-only body: reads e.xb (already staged) and e.dmeta_b (positions).  Graph-capturable:
 // no syncs, no host-dependent branching, fixed buffer addresses.
+// Batched ingest kernels (qwythos_ingest.cu): row/column replications of the per-column
+// kernels in the else-branches - bit-equal by construction, B=8x fewer launches, and the
+// GDN state stays in registers across the chunk (correct s[RPG] indexing - the 10-15
+// divergence was an earlier batched step-norm keeping 4 of 32 rows per thread).
+static const bool iq_old = std::getenv("QWYTHOS_INGEST_OLD") != nullptr;
+extern "C" void iq_row_sum_partials(const float* x, float* partials, int n, int B, void* stream);
+extern "C" void iq_rms_quant_rows(const float* x, const float* w, const float* partials,
+                                  unsigned char* y, int cols, float eps, int q8_stride, void* stream);
+extern "C" void iq_beta_gate_rows(float* beta, float* ggate, const float* dt, const float* ssm_a,
+                                  int n, int B, void* stream);
+extern "C" void iq_conv_l2_rows(float* hist, float* P, int row, const float* w,
+                                int channels, int qk_heads, float eps, int B, void* stream);
+extern "C" void iq_step_norm_rows_q8(float* state, const float* P, int row, const float* gamma,
+                                     const float* bgate, const float* ggate, float* y_out,
+                                     unsigned char* q8, int h_k, int h_v, int z_off, float eps,
+                                     int B, int q8_stride, void* stream);
+extern "C" void iq_split_qg_rows(const float* qg, int row, float* q, float* g, int heads, int hd, int B, void* stream);
+extern "C" void iq_store_kv_rows(const float* k, const float* v, float* kcache, float* vcache,
+                                 const int* dpos, int n, int stride, int B, void* stream);
+extern "C" void iq_swiglu_rows(const float* ug, unsigned char* y, int kff, int B, int q8_stride, void* stream);
+extern "C" void iq_sig_mul_rows(const float* o, const float* z, unsigned char* y, int kemb, int B, int q8_stride, void* stream);
+extern "C" void iq_add_partials_rows(float* x, const float* o, float* partials, int n, int B, void* stream);
+extern "C" void iq_fill_pos_rows(int* dpos, const int* dmeta, int heads, int B, void* stream);
+
 static void serve_ingest_kernels(Engine& e, int B) {
     const size_t q8e = (size_t) kEmb / 32 * 36;
     const size_t q8f = (size_t) kFF / 32 * 36;
-    for (int c = 0; c < B; ++c)
-        row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.xb + (size_t) c * kEmb,
-                                                          e.partials_b + (size_t) c * (kEmb / 4), kEmb);
+    // QWYTHOS_INGEST_TRACE=1: GPU ms per phase, printed once per op from serve_loop
+    struct {
+        bool on = false;
+        double gdn_mm = 0, gdn_chain = 0, gdn_tail = 0, attn_mm = 0, attn_prep = 0, attn_tail = 0;
+    } static tr;
+    tr.on = std::getenv("QWYTHOS_INGEST_TRACE") != nullptr;
+    const bool tr_on = tr.on;
+    auto tr_sync = [&]() { if (tr_on) CK(cudaStreamSynchronize(e.sp)); };
+    auto tr_clock = []() { return std::chrono::steady_clock::now(); };
+    auto tr_acc = [&](double& dst, auto t0, auto t1) {
+        if (tr_on) dst += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    };
+    auto tr_mark0 = [&]() { tr_sync(); return tr_clock(); };
+    (void) tr_mark0;
+    if (iq_old) {
+        for (int c = 0; c < B; ++c)
+            row_sum_partials_kernel<<<kEmb / 4, 1, 0, e.sp>>>(e.xb + (size_t) c * kEmb,
+                                                              e.partials_b + (size_t) c * (kEmb / 4), kEmb);
+    } else {
+        iq_row_sum_partials(e.xb, e.partials_b, kEmb, B, e.sp);
+    }
     ck_launch("bp row_sum");
     // positions arrive in dmeta_b (caller fills it before replay); kernels read their column's slot
     for (int il = 0; il < kLayers; ++il) {
         Layer& L = e.layers[il];
         if (L.recr) {
+            tr_sync();
+            auto trT0 = tr_clock();
+            if (!iq_old) {
+                iq_rms_quant_rows(e.xb, (const float*) L.attn_norm.a, e.partials_b,
+                                  (unsigned char*) e.scratch_pb, kEmb, e.eps, (int) q8e, e.sp);
+                ck_launch("bp rms");
+                tr_sync();
+                auto trT1 = tr_clock();
+                {
+                    const Mat qkvz_p[2] = {L.qkv, L.z_w};
+                    const Mat ab_p[2] = {L.beta_w, L.alpha_w};
+                    mm_q2_group(B, L.cat_qkvz, L.qkvz, qkvz_p, 2, e.scratch_pb, q8e, e.qkvz_ob, kQkv + kEmb, e.sp);
+                    mm_q2_group(B, L.cat_ab, L.ab, ab_p, 2, e.scratch_pb, q8e, e.ab_ob, 2 * kHv, e.sp);
+                }
+                tr_sync();
+                auto trT2 = tr_clock();
+                tr_acc(tr.gdn_mm, trT1, trT2);
+                auto trT3 = tr_clock();
+                iq_beta_gate_rows(e.ab_ob, e.ggate2, L.ssm_dt, L.ssm_a, kHv, B, e.sp);
+                iq_conv_l2_rows(L.conv_state, e.qkvz_ob, kQkv + kEmb, L.conv_w, kQkv, 2 * kHk, e.eps, B, e.sp);
+                if (std::getenv("QWYTHOS_IDUMP") && il == 0) {
+                    float h[4];
+                    CK(cudaMemcpy(h, e.qkvz_ob + (size_t)(B-1) * (kQkv + kEmb), 16, cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr, "idump L0conv %.6f %.6f %.6f %.6f\n", h[0], h[1], h[2], h[3]);
+                }
+                iq_step_norm_rows_q8(L.gdn_state, e.qkvz_ob, kQkv + kEmb, L.ssm_norm,
+                                     e.ab_ob, e.ggate2, e.upb, (unsigned char*) e.scratch_up8_b,
+                                     kHk, kHv, kQkv, e.eps, B, (int) q8e, e.sp);
+                ck_launch("bp gdn");
+                if (std::getenv("QWYTHOS_IDUMP") && il == 0) {
+                    float h[4]; unsigned char q[9];
+                    CK(cudaMemcpy(h, e.upb + (size_t)(B-1) * kEmb, 16, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(q, (char*) e.scratch_up8_b + (size_t)(B-1) * q8e, 9, cudaMemcpyDeviceToHost));
+                    std::fprintf(stderr, "idump L0step %.6f %.6f %.6f %.6f q8 %02x%02x%02x%02x\n",
+                                 h[0], h[1], h[2], h[3], q[0], q[1], q[2], q[3]);
+                }
+                tr_sync();
+                auto trT4 = tr_clock();
+                tr_acc(tr.gdn_chain, trT2, trT4);
+                tr_acc(tr.gdn_tail, trT0, trT4);
+            } else {
             for (int c = 0; c < B; ++c)
                 rms_quant_apply_kernel<<<16, 256, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, (const float*) L.attn_norm.a,
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp rms");
+            if (std::getenv("QWYTHOS_IDUMP") && il == 0) {
+                unsigned char h[9];
+                CK(cudaMemcpy(h, (char*) e.scratch_pb + (size_t)(B-1) * q8e, 9, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "idump L0rms %02x%02x%02x%02x %02x%02x%02x%02x %02x\n",
+                             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[8]);
+            }
             {
                 const Mat qkvz_p[2] = {L.qkv, L.z_w};
                 const Mat ab_p[2] = {L.beta_w, L.alpha_w};
@@ -2131,14 +2242,37 @@ static void serve_ingest_kernels(Engine& e, int B) {
                                                      e.ggate2 + (size_t) c * kHv, kHv);
                 ck_launch("bp beta_gate");
                 strata::kernels::fused_gdn_conv_l2(L.conv_state, qkv_c, L.conv_w, qkv_c, kQkv, 2 * kHk, e.eps, e.sp);
-                strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv_c, qkv_c + kHk * kS,
+                                strata::kernels::fused_gdn_step_norm_silu_q8(L.gdn_state, qkv_c, qkv_c + kHk * kS,
                                                           qkv_c + 2 * kHk * kS, e.ggate2 + (size_t) c * kHv,
                                                           beta_c, z_c, L.ssm_norm, e.eps,
                                                           e.upb + (size_t) c * kEmb,
                                                           (uint8_t*) e.scratch_up8_b + c * q8e, kHk, kHv, e.sp);
             }
             ck_launch("bp gdn");
+            if (std::getenv("QWYTHOS_IDUMP") && il == 0) {
+                float h[4]; unsigned char q[9];
+                CK(cudaMemcpy(h, e.upb + (size_t)(B-1) * kEmb, 16, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(q, (char*) e.scratch_up8_b + (size_t)(B-1) * q8e, 9, cudaMemcpyDeviceToHost));
+                std::fprintf(stderr, "idump L0step %.6f %.6f %.6f %.6f q8 %02x%02x%02x%02x\n",
+                             h[0], h[1], h[2], h[3], q[0], q[1], q[2], q[3]);
+            }
+            }
             mm_q2(B, L.ssm_out.type, L.ssm_out.a, e.scratch_up8_b, e.ob, L.ssm_out.n_in, L.ssm_out.n_out, e.sp);
+            if (!iq_old) {
+                iq_add_partials_rows(e.xb, e.ob, e.partials_b, kEmb, B, e.sp);
+                iq_rms_quant_rows(e.xb, (const float*) L.post_norm.a, e.partials_b,
+                                  (unsigned char*) e.scratch_pb, kEmb, e.eps, (int) q8e, e.sp);
+                ck_launch("bp ffn rms");
+                {
+                    const Mat ug_p[2] = {L.up, L.gate};
+                    mm_q2_group(B, L.cat_upgate, L.upgate, ug_p, 2, e.scratch_pb, q8e, e.ug_ob, 2 * kFF, e.sp);
+                }
+                iq_swiglu_rows(e.ug_ob, (unsigned char*) e.scratch_dn8_b, kFF, B, (int) q8f, e.sp);
+                ck_launch("bp swiglu");
+                mm_q2(B, L.down.type, L.down.a, e.scratch_dn8_b, e.ob, L.down.n_in, L.down.n_out, e.sp);
+                iq_add_partials_rows(e.xb, e.ob, e.partials_b, kEmb, B, e.sp);
+                ck_launch("bp down_add");
+            } else {
             for (int c = 0; c < B; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
@@ -2165,19 +2299,52 @@ static void serve_ingest_kernels(Engine& e, int B) {
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
                     e.partials_b + (size_t) c * (kEmb / 4), kEmb);
             ck_launch("bp down_add");
+            }
         } else {
+            if (!iq_old) {
+                iq_rms_quant_rows(e.xb, (const float*) L.attn_norm.a, e.partials_b,
+                                  (unsigned char*) e.scratch_pb, kEmb, e.eps, (int) q8e, e.sp);
+                ck_launch("bp rms");
+            } else {
             for (int c = 0; c < B; ++c)
                 rms_quant_apply_kernel<<<16, 256, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, (const float*) L.attn_norm.a,
                     e.partials_b + (size_t) c * (kEmb / 4),
                     reinterpret_cast<Q81Row*>((char*) e.scratch_pb + c * q8e), kEmb, e.eps);
             ck_launch("bp rms");
-            {
+            }
+            if (!iq_old) {
+                const Mat q3_p[3] = {L.wq, L.wk, L.wv};
+                mm_q2_group(B, L.cat_qkv3, L.qkv3, q3_p, 3, e.scratch_pb, q8e, e.q3_ob,
+                            2 * kHeads * kHd + 2 * kKv * kHd, e.sp);
+            } else {
                 const Mat q3_p[3] = {L.wq, L.wk, L.wv};
                 mm_q2_group(B, L.cat_qkv3, L.qkv3, q3_p, 3, e.scratch_pb, q8e, e.q3_ob,
                             2 * kHeads * kHd + 2 * kKv * kHd, e.sp);
             }
             constexpr int kv_n = kKv * kHd;
+            if (!iq_old) {
+                auto trA0 = tr_on ? tr_clock() : std::chrono::steady_clock::time_point();
+                iq_fill_pos_rows(e.dpos_b, e.dmeta_b, kHeads, B, e.sp);
+                ck_launch("bp fill_pos");
+                iq_split_qg_rows(e.q3_ob, 2 * kHeads * kHd + 2 * kKv * kHd, e.ob, e.zb, kHeads, kHd, B, e.sp);
+                ck_launch("bp split_qg");
+                rms(e, e.ob, L.qn, B * kHeads, kHd);
+                for (int c = 0; c < B; ++c)
+                    rms(e, e.q3_ob + (size_t) c * (2 * kHeads * kHd + 2 * kKv * kHd) + 2 * kHeads * kHd,
+                        L.kn, kKv, kHd);
+                strata::kernels::native_rope_apply(e.ob, e.ob, B * kHeads, kHd, kRot, e.rope, e.dpos_b, e.sp);
+                for (int c = 0; c < B; ++c)
+                    strata::kernels::native_rope_apply(
+                        e.q3_ob + (size_t) c * (2 * kHeads * kHd + 2 * kKv * kHd) + 2 * kHeads * kHd,
+                        e.q3_ob + (size_t) c * (2 * kHeads * kHd + 2 * kKv * kHd) + 2 * kHeads * kHd,
+                        kKv, kHd, kRot, e.rope, e.dpos_b + (size_t) c * kHeads, e.sp);
+                iq_store_kv_rows(e.q3_ob + 2 * kHeads * kHd, e.q3_ob + 2 * kHeads * kHd + kKv * kHd,
+                                 L.kcache, L.vcache, e.dmeta_b, kv_n, 2 * kHeads * kHd + 2 * kKv * kHd, B, e.sp);
+                ck_launch("bp store_kv");
+                tr_sync();
+                tr_acc(tr.attn_prep, trA0, tr_clock());
+            } else {
             for (int c = 0; c < B; ++c) {
                 const int* meta_c = e.dmeta_b + c;
                 // rope reads dpos[head]: fill this column's per-head slot from its position
@@ -2197,6 +2364,7 @@ static void serve_ingest_kernels(Engine& e, int B) {
                 store_kv2_kernel<<<(2 * kv_n + 255) / 256, 256, 0, e.sp>>>(L.kcache, L.vcache, k_c, v_c,
                                                                            meta_c, kv_n);
                 ck_launch("bp store_kv");
+            }
             }
             static const bool attn_old = std::getenv("QWYTHOS_ATTNOLD") != nullptr;
             if (attn_old || B <= 1) {
@@ -2218,13 +2386,34 @@ static void serve_ingest_kernels(Engine& e, int B) {
                 }
             }
             ck_launch("bp gqa");
-            for (int c = 0; c < B; ++c) {
-                sig_mul_quant_kernel<<<kEmb / 256, 256, 0, e.sp>>>(
-                    e.upb + (size_t) c * kEmb, e.zb + (size_t) c * kEmb,
-                    reinterpret_cast<Q81Row*>((char*) e.scratch_up8_b + c * q8e), kEmb);
+            if (!iq_old) {
+                iq_sig_mul_rows(e.upb, e.zb, (unsigned char*) e.scratch_up8_b, kEmb, B, (int) q8e, e.sp);
+                ck_launch("bp sig_mul");
+            } else {
+                for (int c = 0; c < B; ++c) {
+                    sig_mul_quant_kernel<<<kEmb / 256, 256, 0, e.sp>>>(
+                        e.upb + (size_t) c * kEmb, e.zb + (size_t) c * kEmb,
+                        reinterpret_cast<Q81Row*>((char*) e.scratch_up8_b + c * q8e), kEmb);
+                }
                 ck_launch("bp sig_mul");
             }
             mm_q2(B, L.wo.type, L.wo.a, e.scratch_up8_b, e.ob, L.wo.n_in, L.wo.n_out, e.sp);
+            if (!iq_old) {
+                iq_add_partials_rows(e.xb, e.ob, e.partials_b, kEmb, B, e.sp);
+                ck_launch("bp wo_add");
+                iq_rms_quant_rows(e.xb, (const float*) L.post_norm.a, e.partials_b,
+                                  (unsigned char*) e.scratch_pb, kEmb, e.eps, (int) q8e, e.sp);
+                ck_launch("bp ffn rms");
+                {
+                    const Mat ug_p[2] = {L.up, L.gate};
+                    mm_q2_group(B, L.cat_upgate, L.upgate, ug_p, 2, e.scratch_pb, q8e, e.ug_ob, 2 * kFF, e.sp);
+                }
+                iq_swiglu_rows(e.ug_ob, (unsigned char*) e.scratch_dn8_b, kFF, B, (int) q8f, e.sp);
+                ck_launch("bp swiglu");
+                mm_q2(B, L.down.type, L.down.a, e.scratch_dn8_b, e.ob, L.down.n_in, L.down.n_out, e.sp);
+                iq_add_partials_rows(e.xb, e.ob, e.partials_b, kEmb, B, e.sp);
+                ck_launch("bp down_add");
+            } else {
             for (int c = 0; c < B; ++c)
                 add_partials_1024_kernel<<<kEmb / 4, 1, 0, e.sp>>>(
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
@@ -2251,7 +2440,20 @@ static void serve_ingest_kernels(Engine& e, int B) {
                     e.xb + (size_t) c * kEmb, e.ob + (size_t) c * kEmb,
                     e.partials_b + (size_t) c * (kEmb / 4), kEmb);
             ck_launch("bp down_add");
+            }
         }
+        if (std::getenv("QWYTHOS_IDUMP")) {
+            float h[4];
+            CK(cudaMemcpy(h, e.xb + (size_t)(B - 1) * kEmb, 16, cudaMemcpyDeviceToHost));
+            std::fprintf(stderr, "idump L=%d %.6f %.6f %.6f %.6f\n", il, h[0], h[1], h[2], h[3]);
+            std::fflush(stderr);
+        }
+    }
+    if (tr.on) {
+        std::fprintf(stderr, "itrace B=%d gdn_mm=%.2f gdn_chain=%.2f gdn_tail=%.2f attn_mm=%.2f attn_prep=%.2f attn_tail=%.2f\n",
+                     B, tr.gdn_mm, tr.gdn_chain, tr.gdn_tail, tr.attn_mm, tr.attn_prep, tr.attn_tail);
+        tr.gdn_mm = tr.gdn_chain = tr.gdn_tail = tr.attn_mm = tr.attn_prep = tr.attn_tail = 0;
+        std::fflush(stderr);
     }
 }
 
