@@ -1,6 +1,6 @@
 # Build notes
 
-Rapier tracks upstream Strata **v0.1.44.1**: `git checkout v0.1.44.1` before applying
+Rapier tracks upstream Strata **v0.2.8**: `git checkout v0.1.44.1` before applying
 `patches/*.patch` (they are cut as a diff against that tag).
 
 The exact CMake block (also inline in the README) that adds the `qwythos` target to a
