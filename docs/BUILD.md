@@ -26,7 +26,7 @@ The engine picks the largest visible GPU. With a small second card in the box, p
 big one: `HIP_VISIBLE_DEVICES=1 ./build-hip/qwythos ...`.
 
 Post-update checks: 0.1.37 → 0.1.40.3 rebase (2026-10-07): 76.6 tok/s, ids bit-identical.
-0.1.40.3 → 0.1.41 (2026-10-08) and → 0.1.42 (2026-10-10) rebases: same invariant,
+0.1.40.3 → 0.1.41 (2026-10-08) and → 0.1.42 (2026-10-10), 0.2.3 (2026-10-23) and 0.2.8 (2026-10-30) rebases: same invariant,
 batched GEMM prefill was the default then (155-157 tok/s @8k ingest). That figure is
 not the current path: on 2026-10-15 the hipBLAS chunk was removed because its greedy
 ids did not match the per-token path. Long prompts use the 8-wide Q8 GEMV,
