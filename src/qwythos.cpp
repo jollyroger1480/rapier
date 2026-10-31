@@ -1224,6 +1224,8 @@ void launch_token_gpu(Engine& e) {
 
 // GEMV over two Q8_1 columns: xq8 holds [col0 | col1] blocks, y receives [col0 | col1] outputs.
 // QWYTHOS_GEMV1COLS bisects the multi-column kernel out: two single-column calls on the same bytes.
+static void* g_il_scratch = nullptr;
+static size_t g_il_cap = 0;
 void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in, int n_out, cudaStream_t st) {
     if (std::getenv("QWYTHOS_GEMV1COLS")) {
         const size_t col_bytes = (size_t) (n_in / 32) * 36;
@@ -1237,6 +1239,17 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
             strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, 1, st);
             strata::kernels::native_q8_0_mmvq(w, (const char*) xq8 + col_bytes, y + n_out, n_in, n_out, 1, st);
         }
+        return;
+    }
+    // Ingest (5..8 columns): the interleaved kernels reuse every weight byte across the
+    // columns — measured 1.5-1.9x over the multi GEMV on gfx1030 (mmvq_il_parity --bench),
+    // and bitwise-identical outputs (mmvq_il_parity: every case, T 1-8, bitwise). The
+    // verify window (nc=2) stays on the proven multi path.
+    if (nc >= 5 && nc <= 8 && !std::getenv("QWYTHOS_NOIL") && g_il_scratch &&
+        strata::kernels::native_q8_1_il_bytes(n_in, nc) <= g_il_cap &&
+        (type == 14 || type == 13 || type == 12)) {
+        strata::kernels::native_q8_1_interleave(xq8, g_il_scratch, n_in, nc, st);
+        strata::kernels::native_mmvq_il(type, w, xq8, g_il_scratch, y, n_in, n_out, nc, st);
         return;
     }
     if (type == 14) strata::kernels::native_q6_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
@@ -2126,6 +2139,14 @@ void load_model(Engine& e, const strata::GgufFile& file) {
 // GDN state stays in registers across the chunk (correct s[RPG] indexing - the 10-15
 // divergence was an earlier batched step-norm keeping 4 of 32 rows per thread).
 static const bool iq_old = std::getenv("QWYTHOS_INGEST_OLD") != nullptr;
+static void il_scratch_ensure(int dev) {
+    const size_t need = strata::kernels::native_q8_1_il_bytes(kFF + 64, 8);
+    if (g_il_cap >= need) return;
+    CK(cudaSetDevice(dev));
+    if (g_il_scratch) CK(cudaFree(g_il_scratch));
+    CK(cudaMalloc(&g_il_scratch, need));
+    g_il_cap = need;
+}
 extern "C" void iq_row_sum_partials(const float* x, float* partials, int n, int B, void* stream);
 extern "C" void iq_rms_quant_rows(const float* x, const float* w, const float* partials,
                                   unsigned char* y, int cols, float eps, int q8_stride, void* stream);
@@ -2629,6 +2650,7 @@ static void serve_loop(Engine& e) {
             // chunk did not match those ids (SwiGLU was re-normalized, and the GEMM
             // itself is not the Q8 matvec decode uses).
             if (!nobatch) {
+            il_scratch_ensure(e.primary);
             if (!e.batch_graph && !e.split && bn == 8 && !std::getenv("QWYTHOS_ATRACE")) capture_batch_graph(e);
             while (toks.size() - i >= (size_t) bn) {
                 if (!e.stage_b) CK(cudaMallocHost((void**) &e.stage_b, (size_t) 16 * kEmb * 4));

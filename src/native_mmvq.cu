@@ -32,6 +32,7 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "s26_tsum.cuh"
+#include "q8_1_il.cuh"
 #if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
 #endif
@@ -651,9 +652,53 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
-#if !defined(__HIPCC__)   // CUDA only: the native_mmvq_il_pf_kernel family below (itself CUDA only) is the only user
-// q6_q8_dot_impl with the two scales already in registers (the interleaved kernels' hoisted loads, P1): the same
-// expression in the same order
+// IL helper block: the .nc loads use PTX on CUDA; HIP gets plain volatile loads (gfx1030's L2 is
+// coherent, so the non-coherent hint is a no-op there).  Everything else is portable C++.
+#if defined(__HIPCC__)
+#define STRATA_IL_LDG_ASM 0
+#else
+#define STRATA_IL_LDG_ASM 1
+#endif
+
+#if STRATA_IL_LDG_ASM
+__device__ __forceinline__ int ldg_nc_u16(const void* p) { unsigned v; asm volatile("ld.global.nc.u16 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
+__device__ __forceinline__ int ldg_nc_s8(const void* p) { int v; asm volatile("ld.global.nc.s8 %0, [%1];" : "=r"(v) : "l"(p)); return v; }
+__device__ __forceinline__ int ldg_nc_u8(const void* p) { unsigned v; asm volatile("ld.global.nc.u8 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
+__device__ __forceinline__ int ldg_nc_s32(const void* p) { int v; asm volatile("ld.global.nc.s32 %0, [%1];" : "=r"(v) : "l"(p)); return v; }
+__device__ __forceinline__ int ldg_nc_b2(const void* p, int i32) {   // load_int_b2 pinned: two u16, little-endian
+    const auto* x = static_cast<const uint16_t*>(p) + 2 * i32;
+    return ldg_nc_u16(x) | (ldg_nc_u16(x + 1) << 16);
+}
+__device__ __forceinline__ const void* madw(const void* base, int k, int stride) {
+    const void* r;
+    asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(k), "r"(stride), "l"(base));
+    return r;
+}
+#else
+__device__ __forceinline__ int ldg_nc_u16(const void* p) { return *reinterpret_cast<const uint16_t*>(p); }
+__device__ __forceinline__ int ldg_nc_s8(const void* p) { return *reinterpret_cast<const signed char*>(p); }
+__device__ __forceinline__ int ldg_nc_u8(const void* p) { return *reinterpret_cast<const uint8_t*>(p); }
+__device__ __forceinline__ int ldg_nc_s32(const void* p) { return *reinterpret_cast<const int*>(p); }
+__device__ __forceinline__ int ldg_nc_b2(const void* p, int) {   // two u16, little-endian (load_int_b2 pinned)
+    const unsigned char* x = reinterpret_cast<const unsigned char*>(p);
+    return *reinterpret_cast<const uint16_t*>(x) | (int(*reinterpret_cast<const uint16_t*>(x + 2)) << 16);
+}
+__device__ __forceinline__ const void* madw(const void* base, int k, int stride) {
+    return reinterpret_cast<const char*>(base) + (size_t) k * (size_t) stride;
+}
+#endif
+
+// P2: (float) p for |p| < 2^22 as an add on the FMA pipe instead of the quarter-rate I2F: p + 1.5 * 2^23
+// as float bits is exactly 1.5 * 2^23 + p (unit ulp), and the subtraction is exact (Sterbenz), so the value is the
+// conversion's, +0 included
+__device__ __forceinline__ float i2f_small(int p_plus_magic) { return __int_as_float(p_plus_magic) - 12582912.0f; }
+constexpr int kI2fMagic = 0x4B400000;
+// P2: __vsubss4(x, 0x20202020) for bytes of x in [0, 63] (Q6_K's codes, so nothing saturates): x | 0x80 is x + 0x80 per
+// byte, minus 0x20 never borrows (0x60..0x9f), and the xor takes the 0x80 back: the same int8 bytes, 2 instructions
+// instead of ptxas's 8 for the saturating subtract sm_80 lacks
+__device__ __forceinline__ int sub32_bytes(int x) { return (x + 0x60606060) ^ 0x80808080; }
+// q6_q8_dot_sc with P2's integer forms: the dp4a inputs are the same 32-bit values, (dp * sc) the same int, and
+// i2f_small its exact float (|dp * sc| <= 4 * 32 * 127 * 128 = 2.1M < 2^22), so every FFMA sees the bits q6_q8_dot_impl's does
 __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restrict__ u, int sc0, int sc1, float d,
                                             const float* __restrict__ d8) {
     float sumf = 0.0f;
@@ -668,33 +713,6 @@ __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restr
     }
     return d * sumf;
 }
-
-// P1: loads the compiler may not sink into a later branch (it moved the Q6_K scale and d loads of the hoisted group
-// into the dot sections, where each one is a dependent L1 round trip); the same ld.global.nc the __restrict__ loads use
-__device__ __forceinline__ int ldg_nc_u16(const void* p) { unsigned v; asm volatile("ld.global.nc.u16 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
-__device__ __forceinline__ int ldg_nc_s8(const void* p) { int v; asm volatile("ld.global.nc.s8 %0, [%1];" : "=r"(v) : "l"(p)); return v; }
-__device__ __forceinline__ int ldg_nc_u8(const void* p) { unsigned v; asm volatile("ld.global.nc.u8 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
-__device__ __forceinline__ int ldg_nc_s32(const void* p) { int v; asm volatile("ld.global.nc.s32 %0, [%1];" : "=r"(v) : "l"(p)); return v; }
-__device__ __forceinline__ int ldg_nc_b2(const void* p, int i32) {   // load_int_b2 pinned: two u16, little-endian
-    const auto* x = static_cast<const uint16_t*>(p) + 2 * i32;
-    return ldg_nc_u16(x) | (ldg_nc_u16(x + 1) << 16);
-}
-// P1: base + k * stride as one IMAD.WIDE.U32 (an asm so the front end does not share k * stride between pointers and
-// turn each into a 64-bit add pair)
-__device__ __forceinline__ const void* madw(const void* base, int k, int stride) {
-    const void* r;
-    asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(k), "r"(stride), "l"(base));
-    return r;
-}
-// P2: (float) p for |p| < 2^22 as an add on the FMA pipe instead of the quarter-rate I2F: p + 1.5 * 2^23
-// as float bits is exactly 1.5 * 2^23 + p (unit ulp), and the subtraction is exact (Sterbenz), so the value is the
-// conversion's, +0 included
-__device__ __forceinline__ float i2f_small(int p_plus_magic) { return __int_as_float(p_plus_magic) - 12582912.0f; }
-constexpr int kI2fMagic = 0x4B400000;
-// P2: __vsubss4(x, 0x20202020) for bytes of x in [0, 63] (Q6_K's codes, so nothing saturates): x | 0x80 is x + 0x80 per
-// byte, minus 0x20 never borrows (0x60..0x9f), and the xor takes the 0x80 back: the same int8 bytes, 2 instructions
-// instead of ptxas's 8 for the saturating subtract sm_80 lacks
-__device__ __forceinline__ int sub32_bytes(int x) { return (x + 0x60606060) ^ 0x80808080; }
 // q6_q8_dot_sc with P2's integer forms: the dp4a inputs are the same 32-bit values, (dp * sc) the same int, and
 // i2f_small its exact float (|dp * sc| <= 4 * 32 * 127 * 128 = 2.1M < 2^22), so every FFMA sees the bits q6_q8_dot_impl's does
 __device__ __forceinline__ float q6_q8_dot_fast(int vl, int vh, const int* __restrict__ u, int sc0, int sc1, float d,
@@ -710,7 +728,6 @@ __device__ __forceinline__ float q6_q8_dot_fast(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
-#endif  // !__HIPCC__
 
 __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
                                           const Q81Block* __restrict__ x, int iqs) {
@@ -1589,7 +1606,7 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
     }
 }
 
-#if !defined(__HIPCC__)   // CUDA only: the HIP paths keep native_mmvq's kernels
+#if 1  // IL port: HIP compile experiment (was CUDA-only)
 // ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
 //
 // `native_quantize_q8_1_il` also writes the columns interleaved (native_mmvq.hpp), so one load reads the same int of
@@ -3735,7 +3752,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
-#if !defined(__HIPCC__)
+#if 1  // IL port: the host launchers and dispatch are portable (kernels compile on both)
 std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
     return std::size_t(n_in / Q8K) * std::size_t(native_q8_1_il_cp(ncols)) * (16 * sizeof(int) + sizeof(float));
@@ -3908,10 +3925,28 @@ constexpr IlRows58 kIlRows58_80[] = {   // CMP 170HX, as kIlRows_80
     {11, {{0, 0, 4, 2, 4}, {0, 0, 4, 1, 4}, {0, 0, 1, 1, 1}, {1, 1, 1, 1, 1}}},   // Q3_K
 };
 struct Il58Arch { int cc; const IlRows58* t; size_t n; };
+// gfx1030 (RX 6950 XT, HIP): measured by mmvq_il_parity --bench --emit-table (2026-10-30). Rows are speed-only;
+// every choice is bitwise native_mmvq's output.
+constexpr IlRows kIlRows_103[] = {   // 2-4 columns: r[ncols - 2][cls]
+    {23, {{0, 2, 1, 2, 2}, {1, 4, 2, 2, 2}, {1, 0, 1, 1, 1}}},   // IQ4_XS
+    {12, {{1, 0, 1, 1, 1}, {1, 2, 2, 2, 2}, {1, 4, 4, 4, 4}}},   // Q4_K
+    {13, {{0, 0, 4, 4, 4}, {1, 0, 2, 2, 2}, {1, 4, 4, 4, 4}}},   // Q5_K
+    {14, {{0, 0, 2, 1, 2}, {1, 0, 1, 1, 1}, {1, 0, 1, 1, 1}}},   // Q6_K
+    {11, {{0, 0, 0, 1, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}}},   // Q3_K
+};
+constexpr IlRows58 kIlRows58_103[] = {   // 5-8 columns: r[ncols - 5][cls]
+    {23, {{1, 4, 2, 2, 2}, {1, 0, 1, 4, 4}, {1, 4, 4, 2, 4}, {1, 1, 1, 1, 1}}},   // IQ4_XS
+    {12, {{1, 4, 2, 4, 4}, {1, 0, 1, 1, 1}, {1, 4, 4, 4, 4}, {1, 2, 2, 4, 4}}},   // Q4_K
+    {13, {{1, 0, 1, 1, 1}, {1, 1, 1, 1, 1}, {1, 0, 1, 1, 1}, {1, 2, 4, 4, 4}}},   // Q5_K
+    {14, {{0, 0, 0, 1, 4}, {4, 4, 4, 4, 4}, {1, 1, 1, 1, 1}, {2, 4, 2, 4, 2}}},   // Q6_K
+    {11, {{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}}},   // Q3_K
+};
 constexpr Il58Arch kIl58Arch[] = {
     {80, kIlRows58_80, sizeof(kIlRows58_80) / sizeof(IlRows58)},
     {120, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},
     {1201, kIlRows58_120, sizeof(kIlRows58_120) / sizeof(IlRows58)},   // a 12.0 card with 80+ SMs (il_cc)
+    {103, kIlRows58_103, sizeof(kIlRows58_103) / sizeof(IlRows58)},   // gfx1030: measured (see kIlRows58_103)
+    {104, kIlRows58_103, sizeof(kIlRows58_103) / sizeof(IlRows58)},   // gfx1034: same RDNA2 family
 };
 // One column: rows a warp by n_out class, 0 = native_mmvq's single-column kernels (STRATA_MMVQ_IL_T1=0 turns this off).
 struct Il1Rows { int type; uint8_t r[5]; };
@@ -3967,6 +4002,8 @@ constexpr IlArch kIlArch[] = {
     // 147-verify: RTX PRO 5000 Blackwell (110 SMs).  Only 12.0 cards with 80+ SMs (il_cc's 1201) take it: the shared table
     // was measured on an RTX 5070 (48 SMs) and stays that card's
     {1201, kIlRows_120, sizeof(kIlRows_120) / sizeof(IlRows)},
+    {103, kIlRows_103, sizeof(kIlRows_103) / sizeof(IlRows)},   // gfx1030 (HIP, cc 10.3): measured on an RX 6950 XT
+    {104, kIlRows_103, sizeof(kIlRows_103) / sizeof(IlRows)},   // gfx1034: same RDNA2 family
 };
 // STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..." overrides single rows of the table for every card (type = ggml
 // type 23/12/13/14, ncols 2-4, r* = rows a warp 0/1/2/4 for the five n_out classes).  Parsed once.
@@ -4095,7 +4132,7 @@ bool il_arch_ok() {
 }  // namespace
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
-    if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+    if (ncols < 2 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;   // IL = 2..8 columns (1 col: native_mmvq)
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14);
 }
@@ -4121,23 +4158,7 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
     }
     launch_check();
 }
+#endif  // IL host section
 
-#else  // HIP: no interleaved path
-std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
-void native_quantize_q8_1_il(const float*, void*, void*, int, int, void*) {
-    throw std::invalid_argument("native_quantize_q8_1_il is CUDA only");
-}
-void native_q8_1_interleave(const void*, void*, int, int, void*) {
-    throw std::invalid_argument("native_q8_1_interleave is CUDA only");
-}
-bool native_mmvq_il_supported(int, int, int) { return false; }
-int native_mmvq_il_rows_for(int, int, int, int) { return 0; }
-void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, const void*, float* y, int n_in, int n_out,
-                    int ncols, void* stream) {
-    native_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream);
-}
-void native_mmvq_il_tune(int) {}
-void native_mmvq_il_pf(int) {}
-#endif  // !__HIPCC__
 
 } // namespace strata::kernels
