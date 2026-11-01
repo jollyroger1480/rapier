@@ -147,6 +147,20 @@ curl http://127.0.0.1:8084/v1/chat/completions -H 'Content-Type: application/jso
 `tests/test_rapier_serve.py` verifies: tokenizer ground-truth encode, 40-token bit-exact engine
 stream vs the recorded MTP run, and a live server chat round-trip. All green.
 
+### Sibling brains on the same rig
+
+The engine's shapes are compile-time constants for Qwythos-9B, so other models ride
+llama.cpp on the same card. The first one wired up is the uncensored cyber/coding
+brain — `scripts/serve_cyber.sh` serves **Qwen3-14B-Uncensored Q5_K_M** (9.79 GB,
+[mradermacher GGUF](https://huggingface.co/mradermacher/Qwen3-14B-Uncensored-GGUF))
+on :8085 with the 64K window Hermes Agent requires (YaRN rope scaling, q4_0 KV so
+the full 64K cache fits VRAM next to the weights). Measured on the 6950 XT:
+**46 tok/s decode, 129 tok/s prefill** — roughly 10x the office Qwythos fast brain,
+which trades against its smaller 9B base and the inter-house link. Q6_K (11.29 GB)
+fits too and is the drop-up quant. A 14B thinking model: give `max_tokens` room for
+the reasoning phase. Hermes wiring: provider `cyber` (context_length 65536) with
+aliases `cyber`/`sec` in `~/.hermes/config.yaml`.
+
 ## Status & honest limits
 
 A **research prototype benchmarked on one model and one card**: tensor shapes are compile-time
