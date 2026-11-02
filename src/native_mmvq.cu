@@ -453,7 +453,7 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
 };
 
 __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_HIP_GFX803)
     // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
     const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
@@ -2299,7 +2299,7 @@ void launch_check() {
 }
 
 
-#if defined(STRATA_HIP_GFX906)
+#if defined(STRATA_HIP_GFX906) || defined(STRATA_HIP_GFX803)
 // ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
 // 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
 // butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per

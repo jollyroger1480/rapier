@@ -1,7 +1,17 @@
 # Build notes
 
-Rapier tracks upstream Strata **v0.2.8**: `git checkout v0.1.44.1` before applying
-`patches/*.patch` (they are cut as a diff against that tag).
+Two sources, pick one:
+
+- **Fork branch (recommended, current)**: `jollyroger1480/Strata` branch
+  `port/qwythos-0.2.8` — upstream **v0.2.8** with the whole port as commits
+  (qwythos program, kernels, target wiring, and the experimental
+  `STRATA_HIP_GFX803` Polaris support). Engine program and CMake targets are
+  already wired on the branch; clone, configure, build.
+- **Patch path (legacy base)**: clone upstream Niko1221/Strata, `git checkout
+  v0.1.44.1`, apply `patches/000{1,2,3}-*.patch` (cut as diffs against that
+  tag), copy `src/qwythos.cpp` + `src/test_res.cpp`, add the CMake target block
+  from the README. `patches/0004-gfx803-polaris-experimental.patch` is NOT for
+  this path — it is a port-branch (v0.2.8 base) commit diff and applies there.
 
 The exact CMake block (also inline in the README) that adds the `qwythos` target to a
 Strata HIP build:
@@ -20,7 +30,7 @@ endif()
 Validated toolchain: ROCm 10.1 (`/opt/rocm` → `/data/rocm-10.1.0`), `clang++` from
 `/opt/rocm/llvm/bin`, `CMAKE_HIP_ARCHITECTURES=gfx1030` (add `gfx1034` for an RX
 6500-class second card — `_strata_hip_unvalidated` in `cmake/hip_backend.cmake`
-already carries both on v0.1.44.1, so the port does not patch that file).
+already carries gfx1030/gfx1034 plus gfx900/gfx803 on the port branch).
 
 The engine picks the largest visible GPU. With a small second card in the box, pin the
 big one: `HIP_VISIBLE_DEVICES=1 ./build-hip/qwythos ...`.

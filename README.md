@@ -3,7 +3,7 @@
 <h1 align="center">⚔️ Rapier</h1>
 
 <p align="center"><b>Fast local decode for Qwen3.5-class hybrid models on AMD RDNA2 — with exact-verify MTP.</b><br>
-76.6 tok/s greedy from a 9B Gated-DeltaNet hybrid on an RX 6950 XT — faster than llama.cpp Vulkan on the same card.<br>
+76.6 tok/s greedy base, **94 tok/s with exact-verify MTP** (Q6_K, RX 6950 XT) — faster than llama.cpp Vulkan on the same card.<br>
 Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a> · X <a href="https://x.com/jollyroger1480">@jollyroger1480</a><br>
 <b>💵 Cash App: <a href="https://cash.app/$jollyroger1480">$jollyroger1480</a></b></p>
 
@@ -13,7 +13,17 @@ Rapier is a single-model HIP decode engine for the **qwen35 architecture** (the 
 Gated-DeltaNet linear-attention layers + GQA every 4th layer + an MTP draft head), built as a program
 and two kernel patches inside a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)
 (the MoE engine for Qwen3.8-Flash-Next — itself built on [llama.cpp/ggml](https://github.com/ggml-org/llama.cpp)).
-Patches are cut against upstream **v0.1.44.1**. The two RDNA2 fixes rapier contributed upstream
+Two ways to get the engine; pick one:
+
+- **Fork branch (recommended, current)**: `jollyroger1480/Strata`, branch
+  `port/qwythos-0.2.8` — upstream **v0.2.8** with the whole port as commits
+  (engine program, kernels, and the experimental `STRATA_HIP_GFX803` Polaris
+  support). This is where development happens; 0004 below only applies here.
+- **Patch path (legacy base)**: the three `patches/*.patch` are cut against
+  upstream **v0.1.44.1** — apply them after `git checkout v0.1.44.1`. They carry
+  the same kernel/engine content, just on the older base.
+
+The two RDNA2 fixes rapier contributed upstream
 (portable `alignas` shared-memory declaration for gfx1030, split-shard architecture guard) shipped
 in 0.1.40, and gfx1030 is already on upstream's unvalidated allow-list, so the port does not
 carry either one.
@@ -79,12 +89,17 @@ You need: an AMD RDNA2 card (tested: RX 6950 XT, gfx1030; ROCm ≥ 6 with HIPCC)
 [empero-ai/Qwythos-9B-v2](https://huggingface.co/empero-ai/Qwythos-9B-v2) (Q6_K MTP).
 
 ```sh
-git clone https://github.com/Niko1221/Strata
+# Path A (recommended): the fork branch — v0.2.8 with everything as commits
+git clone -b port/qwythos-0.2.8 https://github.com/jollyroger1480/Strata
 cd Strata
-git checkout v0.1.44.1        # the release these patches are cut against
-git apply /path/to/rapier/patches/*.patch
-cp /path/to/rapier/src/qwythos.cpp src/program/
-cp /path/to/rapier/src/test_res.cpp src/
+# engine program + targets are already wired on the branch; build below
+
+# Path B (legacy v0.1.44.1 base): upstream + patches
+#git clone https://github.com/Niko1221/Strata && cd Strata
+#git checkout v0.1.44.1        # the release patches 0001-0003 are cut against
+#git apply /path/to/rapier/patches/000{1,2,3}-*.patch
+#cp /path/to/rapier/src/qwythos.cpp src/program/
+#cp /path/to/rapier/src/test_res.cpp src/
 
 # add the targets (or copy the block from the patch notes in docs/BUILD.md):
 cat >> CMakeLists.txt <<'EOF'
@@ -104,6 +119,9 @@ cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
   -DCMAKE_PREFIX_PATH=/opt/rocm
 cmake --build build-hip --target qwythos -j8
+# Polaris (RX 480/580, gfx803): add -DSTRATA_HIP_GFX803=ON and the COV4 flag,
+# then see docs/BUILD.md for the runtime bridge:
+#   -DSTRATA_HIP_ARCHITECTURES=gfx803 -DCMAKE_HIP_FLAGS="-mcode-object-version=4"
 ```
 
 ## Run
@@ -147,19 +165,41 @@ curl http://127.0.0.1:8084/v1/chat/completions -H 'Content-Type: application/jso
 `tests/test_rapier_serve.py` verifies: tokenizer ground-truth encode, 40-token bit-exact engine
 stream vs the recorded MTP run, and a live server chat round-trip. All green.
 
-### Sibling brains on the same rig
+### The brain lineup (final, 2026-11)
 
-The engine's shapes are compile-time constants for Qwythos-9B, so other models ride
-llama.cpp on the same card. The first one wired up is the uncensored cyber/coding
-brain — `scripts/serve_cyber.sh` serves **Qwen3-14B-Uncensored Q5_K_M** (9.79 GB,
-[mradermacher GGUF](https://huggingface.co/mradermacher/Qwen3-14B-Uncensored-GGUF))
-on :8085 with the 64K window Hermes Agent requires (YaRN rope scaling, q4_0 KV so
-the full 64K cache fits VRAM next to the weights). Measured on the 6950 XT:
-**46 tok/s decode, 129 tok/s prefill** — roughly 10x the office Qwythos fast brain,
-which trades against its smaller 9B base and the inter-house link. Q6_K (11.29 GB)
-fits too and is the drop-up quant. A 14B thinking model: give `max_tokens` room for
-the reasoning phase. Hermes wiring: provider `cyber` (context_length 65536) with
-aliases `cyber`/`sec` in `~/.hermes/config.yaml`.
+The engine's shapes are compile-time constants for Qwythos-9B, so sibling models ride
+llama.cpp on the same hardware. The rig runs exactly one brain per slot — the fastest
+per slot, everything slower deleted:
+
+| brain | engine | model | measured decode | slot |
+|---|---|---|---|---|
+| **RAPIER** (:8084) | this repo (HIP, MTP) | Qwythos-9B heretic Q6_K | **~94 tok/s** | home fast / uncensored |
+| **Cyber** (:8085) | llama.cpp Vulkan | Qwen3-14B-Uncensored Q5_K_M | **46-48 tok/s** | home security + coding |
+| **Office FAST** (:8183) | llama.cpp Vulkan | Qwythos-9B Q5_K_M | 4.3 tok/s | office quick chats |
+| **Office BIG** (:8184) | llama.cpp Vulkan | Qwen3-Next-80B IQ1_S | 7.8-9.1 tok/s | office heavy (was 1.49) |
+
+Notes worth keeping:
+
+- **Cyber**: `scripts/serve_cyber.sh` — 9.79 GB on the 6950 XT, 64K window for Hermes
+  Agent (YaRN rope scaling, q4_0 KV so the full 64K cache fits VRAM next to the
+  weights), 129 tok/s prefill. Q6_K (11.29 GB) fits and is the drop-up quant. Thinking
+  model: give `max_tokens` room for the reasoning phase.
+- **Office BIG** is the CPU-offload win: `-ngl 99 -ot '.ffn_.*_exps\.weight=CPU'
+  -ctk q8_0 -ctv q8_0` keeps all attention on the office RX 480 (2 GB) and the
+  experts on CPU — 1.49 → 7.8-9.1 tok/s on a 4-core DDR3 box (6x). One brain at a
+  time on that 4 GB card; `--n-cpu-moe` on RADV hits `ErrorDeviceLost` at load, the
+  override-tensor form does not.
+- **Tested and rejected (honest negatives)**: speculative decoding for Cyber
+  (Qwen3-0.6B draft: 47.6 vs 46 tok/s — thinking-model output is high-entropy, drafts
+  don't get accepted) and the HIP backend for Cyber (47.7 — parity with Vulkan on
+  this build). Office BIG is DDR3 dual-channel bandwidth-bound: more sticks buy
+  capacity, not speed (Haswell has 2 channels, period). The walls are GPU silicon,
+  not RAM.
+- **Polaris**: the engine builds for gfx803 (`STRATA_HIP_GFX803`, patch 0004) and the
+  COV4 bridge (docs/BUILD.md) runs ROCm 10 builds on old 5.7 runtimes — verified on a
+  real RX 480. Hermes wiring: providers `rapier`/`cyber`/`office-fast`/`office-big`
+  with a 64K floor per provider; the desktop Service Control panel carries a switch
+  per brain.
 
 ## Status & honest limits
 

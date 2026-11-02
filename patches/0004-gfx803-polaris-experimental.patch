@@ -1,0 +1,164 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 9bc8a326..16dd8c55 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -91,6 +91,13 @@ if(STRATA_HIP_GFX906)
+   set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
+ endif()
+ option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
++option(STRATA_HIP_GFX803 "gfx803 (Polaris, wave64, no dp4a): dp4a byte-mad emulation, experimental" OFF)
++if(STRATA_HIP_GFX803)
++  if(NOT STRATA_ENABLE_HIP)
++    message(FATAL_ERROR "STRATA_HIP_GFX803 requires STRATA_ENABLE_HIP")
++  endif()
++  add_compile_definitions(STRATA_HIP_GFX803=1)
++endif()
+ option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
+ # The rows one verify / batch window holds (include/strata/kernels/window_limits.hpp): 8, the 0.2.7 window, or 16 (four pipelined
+ # groups of 16 slots = 64 slots on a four-card split, docs/BATCHING.md).  Only the CUDA and HIP engines are built from
+diff --git a/cmake/hip_backend.cmake b/cmake/hip_backend.cmake
+index cec90fdb..17ac4a78 100644
+--- a/cmake/hip_backend.cmake
++++ b/cmake/hip_backend.cmake
+@@ -12,7 +12,7 @@ endif()
+ # same wave32 / 64 KiB LDS / sudot4 family as gfx1100, on a unified-memory APU; experimental.
+ set(_strata_hip_validated gfx1100 gfx1201)
+ set(_strata_hip_community gfx1101 gfx1200)
+-set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1032 gfx1034 gfx1150 gfx1151 gfx1152)   # gfx1103: Radeon 780M iGPU, opt-in, WMMA kernels like gfx1100; gfx1152: Krackan, Radeon 860M / 840M (#1625), builds with the portable kernels, no card report yet
++set(_strata_hip_unvalidated gfx900 gfx803 gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1032 gfx1034 gfx1150 gfx1151 gfx1152)   # gfx1103: Radeon 780M iGPU, opt-in, WMMA kernels like gfx1100; gfx1152: Krackan, Radeon 860M / 840M (#1625), builds with the portable kernels, no card report yet
+ # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
+ # spaces, which foreach(IN LISTS) would otherwise treat as one element.
+ string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
+@@ -100,6 +100,12 @@ option(STRATA_GFX1012_PORTABLE_DOT "Use the portable signed-byte dot control on
+ if(STRATA_GFX1012_PORTABLE_DOT)
+   target_compile_definitions(strata_hip_runtime INTERFACE STRATA_GFX1012_PORTABLE_DOT=1)
+ endif()
++if(STRATA_HIP_GFX803)
++  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_HIP_GFX803=1)
++endif()
++if("gfx900" IN_LIST STRATA_HIP_ARCH_LIST)
++  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_HIP_GFX900=1)
++endif()
+ # #313: the RDNA3 WMMA GEMM's intrinsics only compile for gfx11 targets and the host pass does not define
+ # __gfx11xx__, so the build supplies the macro for gfx11 configs (the kernels also gate on the device at runtime)
+ if(CMAKE_HIP_ARCHITECTURES MATCHES "gfx11")
+diff --git a/include/strata/kernels/dp4a.hpp b/include/strata/kernels/dp4a.hpp
+index b9895ac6..fa6e5d1c 100644
+--- a/include/strata/kernels/dp4a.hpp
++++ b/include/strata/kernels/dp4a.hpp
+@@ -20,8 +20,8 @@
+ #pragma once
+ 
+ #include <cstdint>
+-#if defined(STRATA_HIP_GFX906)
+-#include <cuda_runtime.h>   // gfx906: the compat layer (__forceinline__, __nanosleep, __dp4a)
++#if defined(STRATA_HIP_GFX906) || defined(STRATA_HIP_GFX803)
++#include <cuda_runtime.h>   // gfx906/gfx803: the compat layer (__forceinline__, __nanosleep, __dp4a)
+ #endif
+ 
+ #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610
+@@ -38,6 +38,24 @@ __device__ __forceinline__ int strata_dp4a(const int a, const int b, const int c
+     return r;
+ }
+ #define STRATA_DP4A(a, b, c) strata_dp4a((a), (b), (c))
++#elif defined(__HIPCC__) && defined(STRATA_HIP_GFX803)
++// gfx803 (GCN4): no v_dot4 instruction - dp4a as four sign-extended byte products on
++// v_mad_i32_i24 (GCN3+), int32 wraparound accumulation: bitwise __dp4a's.
++__device__ __forceinline__ int dp4a_gfx803(const int a, const int b, const int c) {
++    // pure C++: clang lowers the sign-extended byte products to GCN4 ops (lshr/bfe + mul + add).
++    // v_mad_i32_i24 exists in the GCN4 ISA but ROCm 10's gfx803 integrated assembler rejects all
++    // VOP mnemonics (even through llvm-mc the target parses, so the asm pipeline is gutted, not
++    // the backend) - and inline asm fails through hipcc for EVERY target incl. gfx1030/gfx906.
++    int r = c;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const int ab = (int8_t) ((a >> (8 * i)) & 0xFF);
++        const int bb = (int8_t) ((b >> (8 * i)) & 0xFF);
++        r += ab * bb;
++    }
++    return r;
++}
++#define STRATA_DP4A(a, b, c) dp4a_gfx803((a), (b), (c))
+ #else
+ #define STRATA_DP4A(a, b, c) __dp4a((a), (b), (c))
+ #endif
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 23517382..8e73f5a3 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -453,7 +453,7 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
+ };
+ 
+ __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
+-#if defined(STRATA_HIP_GFX906)
++#if defined(STRATA_HIP_GFX906) || defined(STRATA_HIP_GFX803)
+     // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
+     const uint32_t* v32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
+     const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
+@@ -2299,7 +2299,7 @@ void launch_check() {
+ }
+ 
+ 
+-#if defined(STRATA_HIP_GFX906)
++#if defined(STRATA_HIP_GFX906) || defined(STRATA_HIP_GFX803)
+ // ---- AMD (wave64) layout: one wavefront per R rows, four wavefronts per block, the row's blocks strided over the
+ // 64 lanes exactly as the CUDA kernels stride them over a block (kbx = lane / T, stride 64 / T), and a 64-lane
+ // butterfly instead of the LDS partials and __syncthreads of the one-block-per-row layout: on gfx906 a block per
+diff --git a/src/kernels/cuda/qsa_decode_attn.cu b/src/kernels/cuda/qsa_decode_attn.cu
+index fbbef636..7f6b996b 100644
+--- a/src/kernels/cuda/qsa_decode_attn.cu
++++ b/src/kernels/cuda/qsa_decode_attn.cu
+@@ -1,3 +1,4 @@
++#if !defined(STRATA_HIP_GFX803) && !defined(STRATA_HIP_GFX900)   // QSA: the GLM indexer path - pre-dp4a/dot4 builds exclude it (permlane)
+ // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
+ #include "strata/kernels/qsa_decode_attn.hpp"
+ #include "strata/core/sm75_series.hpp"
+@@ -1267,3 +1268,5 @@ void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShap
+ }
+ 
+ }  // namespace strata::kernels
++
++#endif  // !STRATA_HIP_GFX803
+diff --git a/src/kernels/cuda/s26_tsum.cuh b/src/kernels/cuda/s26_tsum.cuh
+index f484492b..5bbd9a85 100644
+--- a/src/kernels/cuda/s26_tsum.cuh
++++ b/src/kernels/cuda/s26_tsum.cuh
+@@ -11,7 +11,7 @@
+ 
+ namespace strata::kernels::s26ts {
+ 
+-#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906)   // (permlanex16 / DPP row_xmask: gfx10+ only)
++#if defined(__HIP_PLATFORM_AMD__) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_HIP_GFX803) && !defined(STRATA_HIP_GFX900)   // (permlanex16 / DPP row_xmask: gfx10+ only)
+ __device__ __forceinline__ float xmov16(float v) {
+     return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u,
+                                                        false, false));
+diff --git a/src/kernels/mmvq_il_parity.cpp b/src/kernels/mmvq_il_parity.cpp
+index 314f4110..1ad36ba5 100644
+--- a/src/kernels/mmvq_il_parity.cpp
++++ b/src/kernels/mmvq_il_parity.cpp
+@@ -232,16 +232,22 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
+                 ck(cudaStreamSynchronize(s), "il");
+                 ck(cudaMemcpy(b.data(), yil, ybytes, cudaMemcpyDeviceToHost), "read il");
+                 long long diff = 0, nonfinite = 0;
++                double maxabs = 0, maxrel = 0;   // magnitude of the disagreement, not just its count
+                 for (std::size_t i = 0; i < a.size(); ++i) {
+-                    float fa;
++                    float fa, fb;
+                     std::memcpy(&fa, &a[i], 4);
++                    std::memcpy(&fb, &b[i], 4);
+                     if (!std::isfinite(fa)) ++nonfinite;
+                     if (a[i] != b[i]) ++diff;
++                    const double d = std::fabs((double) fa - (double) fb);
++                    if (d > maxabs) maxabs = d;
++                    const double m = std::max(std::fabs((double) fa), 1e-30);
++                    if (d / m > maxrel) maxrel = d / m;
+                 }
+                 if (diff != 0 || nonfinite != 0) {
+                     ++bad;
+-                    std::printf("FAIL %-26s T=%d rows=%d pf=%d: %lld bits differ, %lld non-finite of %zu\n", c.name, T, r, pf, diff,
+-                                nonfinite, a.size());
++                    std::printf("FAIL %-26s T=%d rows=%d pf=%d: %lld bits differ, %lld non-finite of %zu (maxabs %.3g maxrel %.3g)\n",
++                                c.name, T, r, pf, diff, nonfinite, a.size(), maxabs, maxrel);
+                 }
+             }
+             native_mmvq_il_pf(-1);
