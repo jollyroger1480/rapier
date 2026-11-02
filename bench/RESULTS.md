@@ -254,3 +254,68 @@ Pre-existing quirk found while benching (not a regression): resending the exact 
 messages makes the server send a run op with empty `tokens`, which the engine rejects —
 the client sees HTTP 500 "engine line missing id: need tokens and gen". Same guard on the
 0.1.37-based engine; real sessions always append, so it only bites resend-style clients.
+
+---
+
+# Polaris cross-check — RX 480 4GB (gfx803) + office i5 rig, 2026-11-01
+
+Purpose: the same kernels, the weakest plausible RDNA2 card, real 4 GB budget.
+Rig: office desktop, 4-core Haswell i5-class (engine threadpool n_threads=4), 31 GB
+DDR3-1600 dual-channel, Radeon RX 480 4GB (gfx803, wave64, no dp4a — byte-mad
+emulation via `STRATA_HIP_GFX803`). Build: this repo's port branch with
+`CMAKE_HIP_ARCHITECTURES=gfx803 -DCMAKE_HIP_FLAGS="-mcode-object-version=4"` +
+the COV4 runtime bridge (recipe in docs/BUILD.md) against the box's ROCm 5.7
+stack. `mmvq_il_parity --bench` from that build; medians consistent run to run.
+
+## Parity first
+
+- Single-token decode path (T=1): **bitwise identical to the reference for every
+  type and shape tested** (Q6_K/Q5_K/Q4_K/Q3_K/Q8_0/IQ4_XS over all engine dims).
+- Multi-token IL arms (T=2..8): fp32 reduction-order noise only — worst case
+  maxabs 0.000977 over 655 case outputs, 0 non-finite. The dp4a emulation is
+  exact integer math; only the wave64 sum order differs, same class as any
+  GPU-to-GPU move.
+
+## T=1 cold MMVQ bench (µs; effective GB/s in parens)
+
+2560-row shapes are the engine's dense GEMV dims; 6144×2560 = ffn up-proj;
+"head" = 2560×248320 vocab mat; IL rows1 = best IL variant.
+
+| case | multi | best IL |
+|---|---|---|
+| Q6_K 2560×12288 | 160.2 (166 GB/s) | 148.6 (178 GB/s) |
+| Q5_K 2560×12288 | 210.3 (105 GB/s) | 189.0 (116 GB/s) |
+| IQ4_XS 2560×12288 | 129.4 (127 GB/s) | 103.1 (132 GB/s) |
+| Q3_K 2560×12288 | 191.4 | 155.0 |
+| Q4_K 2560×10240 | 163.0 | 146.7 |
+| Q6_K 6144×2560 | 85.8 | 81.5 |
+| Q5_K 6144×2560 | 91.5 | 81.3 |
+| IQ4_XS 6144×2560 | 52.6 | 52.6 |
+| Q3_K 6144×2560 | 76.9 | 65.8 |
+| Q5_K head 2560×248320 | 5321.7 (91 GB/s) | 4754.9 |
+
+Effective bandwidth ~half of Polaris peak (211 GB/s paper) through emulated dp4a,
+every type. For scale, the 6950 XT runs the same kernels at 956-992 GB/s
+IC-resident / ~553 GB/s DRAM (see the 2026-10-02 pass above) — gfx803 is real,
+just five times further from its ceiling, which is the dp4a emulation tax plus
+wave64.
+
+## Whole-brain numbers on the same 4 GB card
+
+- Engine (qwythos, Q3_K_S requant 4.03 GiB): **OOM at load** — usable VRAM is
+  ~3.9 GiB and the smallest sane quant does not fit. The engine needs its whole
+  model resident; a >4 GB card is the entry ticket for a 9B.
+- llama.cpp Qwythos Q5_K_M (6.19 GB), `-ngl 26 -c 65536 -ctk/-ctv q8_0`:
+  **4.27 tok/s** decode at the 64K window Hermes requires (5.16 at 8K ctx), on
+  the RADV Vulkan stack. `Q3_K`-class quants fit VRAM but IQ-family quants
+  (IQ2_XXS/IQ3_XXS) have no Vulkan kernels and fall back to CPU: IQ2_XXS ngl 99
+  measured **3.60 tok/s** — slower than the partial-offload Q5_K_M.
+- Same card, 80B MoE (Qwen3-Next-80B IQ1_S, experts on CPU via the
+  override-tensor split): **1.49 → 7.8-9.1 tok/s** decode. The DDR3-1600
+  dual-channel bus is that number's wall — capacity upgrades (more sticks) do
+  not move it on a 2-channel Haswell platform.
+
+Takeaway: the port's kernel path is Polaris-clean (bitwise at T=1), the card is
+VRAM-bound for 9B+, and the fastest real config on a 4 GB Polaris box is the
+partial-offload Q5_K_M at ~4 tok/s — or the CPU-offloaded MoE trick for big
+models at ~8-9 tok/s.
