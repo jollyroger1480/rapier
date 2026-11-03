@@ -1,5 +1,21 @@
+commit fff915bd8a0a53eb6e48dc6a26687ba66e7891e4
+Author: jollyroger1480 <jollyroger1480@gmail.com>
+Date:   Mon Nov 2 07:40:39 2026 -0500
+
+    gfx803 (Polaris) experimental support: STRATA_HIP_GFX803 option
+    
+    - STRATA_HIP_GFX803 CMake option: dp4a byte-mad emulation (dp4a.hpp),
+      wave64 MMVQ layout gates extended from GFX906 to GFX803 (native_mmvq.cu),
+      iq4 table lookup via v_perm, gfx900/gfx803 on the unvalidated arch list,
+      qsa_decode_attn.cu + s26_tsum.cuh excluded (need gfx10+ insts)
+    - mmvq_il_parity: STRATA_IL_HIP_BUILD guard for the L2 persist window +
+      magnitude readout on the FAIL line (maxabs/maxrel)
+    - Verified on a real RX 480 through the COV4 bridge (rapier docs/BUILD.md):
+      T=1 bitwise, IL arms reorder-noise only, office fast brain runs 64K ctx
+      on 4 GB
+
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 9bc8a326..16dd8c55 100644
+index 7441aa7d..16e54b64 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -91,6 +91,13 @@ if(STRATA_HIP_GFX906)
@@ -14,8 +30,8 @@ index 9bc8a326..16dd8c55 100644
 +  add_compile_definitions(STRATA_HIP_GFX803=1)
 +endif()
  option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
- # The rows one verify / batch window holds (include/strata/kernels/window_limits.hpp): 8, the 0.2.7 window, or 16 (four pipelined
- # groups of 16 slots = 64 slots on a four-card split, docs/BATCHING.md).  Only the CUDA and HIP engines are built from
+ # The community-made AMD changes (include/strata/core/amd_community.hpp): on by default.  This option is the build half of the one
+ # switch STRATA_AMD_COMMUNITY_TUNING: OFF compiles the portable signed-byte dot for gfx1010 again (the SDWA sequence of #4855).
 diff --git a/cmake/hip_backend.cmake b/cmake/hip_backend.cmake
 index cec90fdb..17ac4a78 100644
 --- a/cmake/hip_backend.cmake
@@ -83,10 +99,10 @@ index b9895ac6..fa6e5d1c 100644
  #define STRATA_DP4A(a, b, c) __dp4a((a), (b), (c))
  #endif
 diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
-index 23517382..8e73f5a3 100644
+index 14f05a3c..851cc3c1 100644
 --- a/src/kernels/cuda/native_mmvq.cu
 +++ b/src/kernels/cuda/native_mmvq.cu
-@@ -453,7 +453,7 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
+@@ -454,7 +454,7 @@ __device__ __align__(4) int8_t iq4nl_values[16] = {
  };
  
  __device__ __forceinline__ int2 iq4_table_lookup(int q4) {
@@ -95,7 +111,7 @@ index 23517382..8e73f5a3 100644
      // AMD: llama.cpp's HIP lookup (see iq_kernels.cu get_int_from_table_16): 4 v_perm_b32 per 8 values
      const uint32_t* v32 = reinterpret_cast<const uint32_t*>(iq4nl_values);
      const uint32_t q_even = (uint32_t) q4, q_odd = (uint32_t) q4 >> 4;
-@@ -2299,7 +2299,7 @@ void launch_check() {
+@@ -2331,7 +2331,7 @@ void launch_check() {
  }
  
  
@@ -133,10 +149,10 @@ index f484492b..5bbd9a85 100644
      return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(v), __float_as_int(v), 0x76543210u, 0xfedcba98u,
                                                         false, false));
 diff --git a/src/kernels/mmvq_il_parity.cpp b/src/kernels/mmvq_il_parity.cpp
-index 314f4110..1ad36ba5 100644
+index 09e5fdbb..09ae17fd 100644
 --- a/src/kernels/mmvq_il_parity.cpp
 +++ b/src/kernels/mmvq_il_parity.cpp
-@@ -232,16 +232,22 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
+@@ -233,16 +233,22 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
                  ck(cudaStreamSynchronize(s), "il");
                  ck(cudaMemcpy(b.data(), yil, ybytes, cudaMemcpyDeviceToHost), "read il");
                  long long diff = 0, nonfinite = 0;

@@ -42,7 +42,18 @@ constexpr int kHd = 256;
 constexpr int kHeads = 16;
 constexpr int kKv = 4;
 constexpr int kRot = 64;
-constexpr int kMaxCtx = 65536;  // 64K: Hermes Agent minimum; KV cost ~2.4 GB VRAM
+// 64K default: Hermes Agent minimum; KV cost ~2.4 GB VRAM at 64K.
+// QWYTHOS_MAXCTX shrinks it at startup (small-VRAM cards: 8192 cuts KV ~8x).
+static const int kMaxCtx = [] {
+    if (const char* s = std::getenv("QWYTHOS_MAXCTX")) {
+        int v = std::atoi(s);
+        if (v >= 1024 && v <= 65536) return v;
+    }
+    return 65536;
+}();
+// device-side mirror: two attention kernels index score rows by it; the host
+// pushes the QWYTHOS_MAXCTX value once before the first launch.
+__device__ int g_dctx = 65536;
 // set at parse time (--serve); silences stdout chatter that would corrupt the JSON protocol
 static bool g_serve_mode = false;
 static bool cur_dev_valid = false;  // serve: d_logits holds the last token's logits
@@ -88,6 +99,8 @@ size_t row_bytes(int type, int n_in) {
     if (type == 14) return (size_t) (n_in / 256) * 210;
     if (type == 13) return (size_t) (n_in / 256) * 176;
     if (type == 12) return (size_t) (n_in / 256) * 144;
+    if (type == 11) return (size_t) (n_in / 256) * 110;
+    if (type == 23) return (size_t) (n_in / 256) * 136;
     return 0;
 }
 
@@ -96,6 +109,8 @@ size_t row_bytes(int type, int n_in) {
 static inline void emb_dequant_block(int type, const uint8_t* src, size_t b, float* dst) {
     if (type == 13) strata::dequantize_q5_K(src + b * 176, dst + b * 256);
     else if (type == 12) strata::dequantize_q4_K(src + b * 144, dst + b * 256);
+    else if (type == 11) strata::dequantize_q3_K(src + b * 110, dst + b * 256);
+    else if (type == 23) strata::dequantize_iq4_xs(src + b * 136, dst + b * 256);
     else strata::dequantize_q6_K(src + b * 210, dst + b * 256);
 }
 
@@ -474,7 +489,7 @@ __global__ void __launch_bounds__(256) gqa_score_chunk_kernel(const float* __res
 #pragma unroll
             for (int qh = 0; qh < GQA; ++qh) {
                 const int h = kv * GQA + qh;
-                float* sc = scores + ((size_t) c * kHeads + h) * kMaxCtx;
+                float* sc = scores + ((size_t) c * kHeads + h) * g_dctx;
                 for (int t = 0; t < tn; ++t) {
                     const int tok = t0 + t;
                     if (tok > pos) continue;
@@ -506,7 +521,7 @@ __global__ void __launch_bounds__(256) gqa_from_scores_kernel(const float* __res
     if (tid == 0) ntoks = meta[0] + 1;
     __syncthreads();
     const int n_tok = ntoks;
-    const float* sc = scores + (size_t) h * kMaxCtx;
+    const float* sc = scores + (size_t) h * g_dctx;
 
     float m = -1e30f;
     for (int t = tid; t < n_tok; t += 256) m = fmaxf(m, sc[t]);
@@ -720,6 +735,8 @@ void mm_q(int type, const void* w, const void* xq, float* y, int n_in, int n_out
     else if (type == 13) strata::kernels::native_q5_k_mmvq(w, xq, y, n_in, n_out, 1, st);
     else if (type == 12) strata::kernels::native_q4_k_mmvq(w, xq, y, n_in, n_out, 1, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq, y, n_in, n_out, 1, st);
+    else if (type == 11) strata::kernels::native_q3_k_mmvq(w, xq, y, n_in, n_out, 1, st);
+    else if (type == 23) strata::kernels::native_iq4_xs_mmvq(w, xq, y, n_in, n_out, 1, st);
     else {
         std::fprintf(stderr, "bad gemv type %d\n", type);
         std::exit(1);
@@ -828,7 +845,7 @@ void mm_q_res(int type, const void* w, const void* xq8, float* y, float* partial
     else if (type == 12) strata::kernels::native_q4_k_mmvq_res(w, xq8, y, y, partials, n_in, n_out, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq_res(w, xq8, y, y, partials, n_in, n_out, st);
     else {
-        std::fprintf(stderr, "bad res gemv type %d\n", type);
+        std::fprintf(stderr, "bad gemv_res type %d (res path has no q3/iq4 kernels — keep that tensor at Q4_K+)\n", type);
         std::exit(1);
     }
 }
@@ -892,7 +909,7 @@ void upload_mat(Engine& e, Mat& m, const Tensor& t) {
     m.type = t.type;
     m.n_in = t.n_in;
     m.n_out = t.n_out;
-    if (t.type != 14 && t.type != 13 && t.type != 12 && t.type != 8) {
+    if (t.type != 14 && t.type != 13 && t.type != 12 && t.type != 8 && t.type != 11 && t.type != 23) {
         std::fprintf(stderr, "upload_mat type %d\n", t.type);
         std::exit(1);
     }
@@ -1232,7 +1249,7 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
         if (type == 14) {
             strata::kernels::native_q6_k_mmvq(w, xq8, y, n_in, n_out, 1, st);
             strata::kernels::native_q6_k_mmvq(w, (const char*) xq8 + col_bytes, y + n_out, n_in, n_out, 1, st);
-        } else if (type == 13 || type == 12) {
+        } else if (type == 13 || type == 12 || type == 11 || type == 23) {
             mm_q(type, w, xq8, y, n_in, n_out, st);
             mm_q(type, w, (const char*) xq8 + col_bytes, y + n_out, n_in, n_out, st);
         } else {
@@ -1247,7 +1264,7 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
     // verify window (nc=2) stays on the proven multi path.
     if (nc >= 5 && nc <= 8 && !std::getenv("QWYTHOS_NOIL") && g_il_scratch &&
         strata::kernels::native_q8_1_il_bytes(n_in, nc) <= g_il_cap &&
-        (type == 14 || type == 13 || type == 12)) {
+        (type == 14 || type == 13 || type == 12 || type == 11 || type == 23)) {
         strata::kernels::native_q8_1_interleave(xq8, g_il_scratch, n_in, nc, st);
         strata::kernels::native_mmvq_il(type, w, xq8, g_il_scratch, y, n_in, n_out, nc, st);
         return;
@@ -1256,6 +1273,8 @@ void mm_q2(int nc, int type, const void* w, const void* xq8, float* y, int n_in,
     else if (type == 13) strata::kernels::native_q5_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else if (type == 12) strata::kernels::native_q4_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else if (type == 8) strata::kernels::native_q8_0_mmvq(w, xq8, y, n_in, n_out, nc, st);
+    else if (type == 11) strata::kernels::native_q3_k_mmvq(w, xq8, y, n_in, n_out, nc, st);
+    else if (type == 23) strata::kernels::native_iq4_xs_mmvq(w, xq8, y, n_in, n_out, nc, st);
     else {
         std::fprintf(stderr, "bad gemv2 type %d in %d out %d\n", type, n_in, n_out);
         std::exit(1);
@@ -1853,6 +1872,10 @@ void alloc_primary(Engine& e) {
     CK(cudaMalloc(&e.conv_snap, (size_t) kLayers * 3 * kQkv * 4));
     CK(cudaMalloc(&e.h_save, (size_t) 2 * kEmb * 4));
     CK(cudaMalloc(&e.h_partials2, (size_t) 2 * (kEmb / 4) * 4));
+    {   // one-time: attention kernels take their score stride from the device mirror
+        int hctx = kMaxCtx;
+        CK(hipMemcpyToSymbol(g_dctx, &hctx, sizeof(int)));
+    }
     CK(cudaMalloc(&e.kcache32, (size_t) kMaxCtx * kKv * kHd * 4));
     CK(cudaMalloc(&e.vcache32, (size_t) kMaxCtx * kKv * kHd * 4));
     CK(cudaMemset(e.kcache32, 0, (size_t) kMaxCtx * kKv * kHd * 4));
@@ -1978,7 +2001,7 @@ void load_model(Engine& e, const strata::GgufFile& file) {
                 e.rope.factor, e.rope.freq_base, e.rope.orig_ctx, e.eps);
 
     Tensor emb = take(file, "token_embd.weight");
-    if ((emb.type != 14 && emb.type != 13 && emb.type != 12) || emb.n_in != kEmb || emb.n_out != kVocab) {
+    if ((emb.type != 14 && emb.type != 13 && emb.type != 12 && emb.type != 11 && emb.type != 23) || emb.n_in != kEmb || emb.n_out != kVocab) {
         std::fprintf(stderr, "unexpected embedding\n");
         std::exit(1);
     }
