@@ -3,7 +3,7 @@
 Two sources, pick one:
 
 - **Fork branch (recommended, current)**: `jollyroger1480/Strata` branch
-  `port/qwythos-0.2.10` — upstream **v0.2.10** with the whole port as commits
+  `port/qwythos-0.2.12` — upstream **v0.2.12** with the whole port as commits
   (qwythos program, kernels, target wiring, and the experimental
   `STRATA_HIP_GFX803` Polaris support). Engine program and CMake targets are
   already wired on the branch; clone, configure, build.
@@ -11,7 +11,7 @@ Two sources, pick one:
   v0.1.44.1`, apply `patches/000{1,2,3}-*.patch` (cut as diffs against that
   tag), copy `src/qwythos.cpp` + `src/test_res.cpp`, add the CMake target block
   from the README. `patches/0004-gfx803-polaris-experimental.patch` is NOT for
-  this path — it is a port-branch (v0.2.10 base) commit diff and applies there.
+  this path — it is a port-branch (v0.2.12 base) commit diff and applies there.
 
 The exact CMake block (also inline in the README) that adds the `qwythos` target to a
 Strata HIP build:
@@ -42,6 +42,11 @@ not the current path: on 2026-10-15 the hipBLAS chunk was removed because its gr
 ids did not match the per-token path. Long prompts use the 8-wide Q8 GEMV,
 with that chunk's K scores read once (`QWYTHOS_BN=16` is the same ids).
 0.1.42 → 0.1.44.1 (2026-10-15): patches recut against that tag.
+0.2.10 → 0.2.12 (2026-11-08): five port commits rebased onto v0.2.12 with no
+conflicts. Upstream's 0.2.11/0.2.12 speed work is Flash-Next, DFlash2, gfx12,
+Strix Halo and Mac — not the qwythos RDNA2 path — so this rebase does not
+claim a new tok/s number. The live brain keeps `build-hip/qwythos` until the
+side build `build-hip-0212/qwythos` is id-checked.
 `build-hip/test_res` = synthetic parity harness for the MMVQ
 residual-epilogue kernels (run on a sacrificial card, not your display GPU).
 
