@@ -178,8 +178,9 @@ def engine_start():
         [ENGINE_BIN, "--model", MODEL_FILE, "--serve"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=sys.stderr, text=True, bufsize=1,
-        env={**os.environ, "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES", "1"),
-             "QWYTHOS_MAXCTX": str(CTX)},
+        # HIP_VISIBLE_DEVICES is passed through when set; unset means HIP's default device,
+        # so a single-GPU box works without config (a hard "1" broke it).
+        env={**os.environ, "QWYTHOS_MAXCTX": str(CTX)},
     )
 
 

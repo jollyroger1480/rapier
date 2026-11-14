@@ -6,7 +6,7 @@
 3. server: /v1/chat/completions greedy parity + multi-turn
 
 Run:  python3 tests/test_rapier_serve.py [--skip-server]
-Requires the engine built and HIP_VISIBLE_DEVICES pinned to the big card.
+Requires the engine built. On a multi-GPU box set HIP_VISIBLE_DEVICES to the big card first.
 """
 import json
 import os
@@ -32,7 +32,7 @@ def test_engine_serve():
                      separators=(",", ":"))  # the C++ parser matches compact "key":[ exactly
     cmd = "echo " + json.dumps(req) + " | (sleep 60; cat) | " + ENGINE + " --model " + MODEL + " --serve"
     r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=180,
-                       env={**os.environ, "HIP_VISIBLE_DEVICES": "1"})
+                       env=dict(os.environ))
     got = []
     for line in r.stdout.splitlines():
         try:
@@ -57,7 +57,7 @@ def test_tokenizer():
 def test_server():
     srv = subprocess.Popen([sys.executable,
                             os.path.join(os.path.dirname(__file__), "..", "server", "rapier_server.py")],
-                           env={**os.environ, "HIP_VISIBLE_DEVICES": "1", "RAPIER_PORT": "8085"},
+                           env={**os.environ, "RAPIER_PORT": "8085"},
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         base = "http://127.0.0.1:8085"

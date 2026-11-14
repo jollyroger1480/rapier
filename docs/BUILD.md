@@ -33,7 +33,7 @@ Validated toolchain: ROCm 10.1 (`/opt/rocm` → `/data/rocm-10.1.0`), `clang++` 
 already carries gfx1030/gfx1034 plus gfx900/gfx803 on the port branch).
 
 The engine picks the largest visible GPU. With a small second card in the box, pin the
-big one: `HIP_VISIBLE_DEVICES=1 ./build-hip/qwythos ...`.
+big one by its HIP index, e.g. `HIP_VISIBLE_DEVICES=1 ./build-hip/qwythos ...`. A single-GPU box needs nothing.
 
 Post-update checks: 0.1.37 → 0.1.40.3 rebase (2026-10-07): 76.6 tok/s, ids bit-identical.
 0.1.40.3 → 0.1.41 (2026-10-08) and → 0.1.42 (2026-10-10), 0.2.3 (2026-10-23) and 0.2.8 (2026-10-30) rebases: same invariant,

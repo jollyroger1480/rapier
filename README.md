@@ -156,7 +156,7 @@ this binary, 400 greedy MTP tokens, 94.1 tok/s with 191/207 draft steps accepted
 That decode figure is a new measurement, not a claim that attention changed it.
 
 ```sh
-HIP_VISIBLE_DEVICES=1 python3 server/rapier_server.py     # :8084, OpenAI-compatible
+python3 server/rapier_server.py     # :8084, OpenAI-compatible (multi-GPU: set HIP_VISIBLE_DEVICES to the big card)
 curl http://127.0.0.1:8084/v1/chat/completions -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer local' \
   -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":64,"temperature":0}'
