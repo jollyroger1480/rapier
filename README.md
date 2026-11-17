@@ -3,7 +3,7 @@
 <h1 align="center">⚔️ Rapier</h1>
 
 <p align="center"><b>Fast local decode for Qwen3.5-class hybrid models on AMD RDNA2 — with exact-verify MTP.</b><br>
-76.6 tok/s greedy base, **94 tok/s with exact-verify MTP** (Q6_K, RX 6950 XT) — faster than llama.cpp Vulkan on the same card.<br>
+**94.1 tok/s greedy with exact-verify MTP** (400 tokens, Q6_K, RX 6950 XT, 2026-10-15 build), 66.3 tok/s without MTP — llama.cpp Vulkan does ~67 on the same card.<br>
 Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a></p>
 
 ---
@@ -29,7 +29,7 @@ carry either one.
 
 It exists because on RDNA2, a decoder purpose-built for one model beats a general one:
 
-| greedy decode, Qwythos-9B-v2 Q6_K, RX 6950 XT (gfx1030, HIP) | tok/s @ 32 tok | tok/s @ 400 tok |
+| greedy decode, Qwythos-9B-v2 Q6_K, RX 6950 XT (gfx1030, HIP), 2026-10-03 build | tok/s @ 32 tok | tok/s @ 400 tok |
 | --- | ---: | ---: |
 | llama.cpp b6731 Vulkan (RADV) | 67.1 | ~67 |
 | Strata + Rapier, no MTP | 68.6 | 66.3 |
@@ -37,8 +37,9 @@ It exists because on RDNA2, a decoder purpose-built for one model beats a genera
 
 Long-context note: before Rapier's attention rewrite the same workload collapsed to **12.6 tok/s**
 at position ~200 (a single-warp GQA kernel); it is now flat across context. Total speedup over the
-starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07 rebase):
-76.6 tok/s @ 400 greedy-MTP from the CLI, 75.9 through HTTP serving.
+starting point: **44.8 → 94.1 tok/s (+110%)**. On the 0.1.40.3 base (2026-10-07 rebase):
+76.6 tok/s @ 400 greedy-MTP from the CLI, 75.9 through HTTP serving. On the 2026-10-15
+build: 94.1 tok/s @ 400 greedy-MTP from the CLI (HTTP serving not retested on that build).
 
 Free to use. If it saved you time, tips are welcome: [Cash App](https://cash.app/$jollyroger1480) or Bitcoin `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`. More links at the [bottom](#support-and-links).
 
