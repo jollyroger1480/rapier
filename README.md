@@ -4,8 +4,7 @@
 
 <p align="center"><b>Fast local decode for Qwen3.5-class hybrid models on AMD RDNA2 — with exact-verify MTP.</b><br>
 76.6 tok/s greedy base, **94 tok/s with exact-verify MTP** (Q6_K, RX 6950 XT) — faster than llama.cpp Vulkan on the same card.<br>
-Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a> · X <a href="https://x.com/jollyroger1480">@jollyroger1480</a><br>
-<b>💵 Cash App: <a href="https://cash.app/$jollyroger1480">$jollyroger1480</a></b></p>
+Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a></p>
 
 ---
 
@@ -40,6 +39,8 @@ Long-context note: before Rapier's attention rewrite the same workload collapsed
 at position ~200 (a single-warp GQA kernel); it is now flat across context. Total speedup over the
 starting point: **44.8 → 76.6 tok/s (+71%)**. On the 0.1.40.3 base (2026-10-07 rebase):
 76.6 tok/s @ 400 greedy-MTP from the CLI, 75.9 through HTTP serving.
+
+Free to use. If it saved you time, tips are welcome: [Cash App](https://cash.app/$jollyroger1480) or Bitcoin `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`. More links at the [bottom](#support-and-links).
 
 ## What's in the box
 
@@ -207,6 +208,16 @@ A **research prototype benchmarked on one model and one card**: tensor shapes ar
 constants for Qwythos-9B (4096 hidden, 32 v-heads, …); no tokenizer, no server, greedy only.
 The RDNA2 DRAM ceiling (~0.5 GB/s per GB/s of paper spec, measured) bounds everything — Rapier wins
 by removing launches and passes, not by breaking physics. Bugs and measurements welcome.
+
+## Support and links
+
+This project is free, and a tip is welcome but never expected.
+
+- Tip (Cash App): [$jollyroger1480](https://cash.app/$jollyroger1480)
+- Bitcoin: `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`
+- eBay store: [Buccaneer Salvage](https://www.ebay.com/str/buccaneersalvage)
+- YouTube: [@BuccaneerSalvage](https://www.youtube.com/@BuccaneerSalvage)
+- X: [@jollyroger1480](https://x.com/jollyroger1480)
 
 ## Credits & license
 
