@@ -8,6 +8,8 @@ Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a></p>
 
 ---
 
+Free to use. If it saved you time, tips are welcome: [Cash App](https://cash.app/$jollyroger1480) or Bitcoin `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`. More links at the [bottom](#support-and-links).
+
 Rapier is a single-model HIP decode engine for the **qwen35 architecture** (the Qwen3.5/Next hybrid:
 Gated-DeltaNet linear-attention layers + GQA every 4th layer + an MTP draft head), built as a program
 and two kernel patches inside a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata)
@@ -40,8 +42,6 @@ at position ~200 (a single-warp GQA kernel); it is now flat across context. Tota
 starting point: **44.8 → 94.1 tok/s (+110%)**. On the 0.1.40.3 base (2026-10-07 rebase):
 76.6 tok/s @ 400 greedy-MTP from the CLI, 75.9 through HTTP serving. On the 2026-10-15
 build: 94.1 tok/s @ 400 greedy-MTP from the CLI (HTTP serving not retested on that build).
-
-Free to use. If it saved you time, tips are welcome: [Cash App](https://cash.app/$jollyroger1480) or Bitcoin `bc1qydycnf5pjhez5d0mrgmmumyv2g5nc63mwet89j`. More links at the [bottom](#support-and-links).
 
 ## What's in the box
 
