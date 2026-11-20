@@ -3,7 +3,7 @@
 Two sources, pick one:
 
 - **Fork branch (recommended, current)**: `jollyroger1480/Strata` branch
-  `port/qwythos-0.2.12` — upstream **v0.2.12** with the whole port as commits
+  `port/qwythos-0.2.16` — upstream **v0.2.16** with the whole port as commits
   (qwythos program, kernels, target wiring, and the experimental
   `STRATA_HIP_GFX803` Polaris support). Engine program and CMake targets are
   already wired on the branch; clone, configure, build.
@@ -11,10 +11,11 @@ Two sources, pick one:
   v0.1.44.1`, apply `patches/000{1,2,3}-*.patch` (cut as diffs against that
   tag), copy `src/qwythos.cpp` + `src/test_res.cpp`, add the CMake target block
   from the README. `patches/0004-gfx803-polaris-experimental.patch` is NOT for
-  this path — it is a port-branch (v0.2.12 base) commit diff and applies there.
+  this path — it is a port-branch (v0.2.16 base, `engine/` paths) commit diff and applies there.
 
 The exact CMake block (also inline in the README) that adds the `qwythos` target to a
-Strata HIP build:
+Strata HIP build (on the 0.2.16 port branch it sits in `engine/cmake/strata_gpu_engine.cmake`,
+paths relative to `engine/`):
 
 ```cmake
 if(STRATA_ENABLE_HIP)
@@ -29,7 +30,7 @@ endif()
 
 Validated toolchain: ROCm 10.1 (`/opt/rocm` → `/data/rocm-10.1.0`), `clang++` from
 `/opt/rocm/llvm/bin`, `CMAKE_HIP_ARCHITECTURES=gfx1030` (add `gfx1034` for an RX
-6500-class second card — `_strata_hip_unvalidated` in `cmake/hip_backend.cmake`
+6500-class second card — `_strata_hip_unvalidated` in `engine/cmake/hip_backend.cmake`
 already carries gfx1030/gfx1034 plus gfx900/gfx803 on the port branch).
 
 The engine picks the largest visible GPU. With a small second card in the box, pin the
@@ -47,6 +48,21 @@ conflicts. Upstream's 0.2.11/0.2.12 speed work is Flash-Next, DFlash2, gfx12,
 Strix Halo and Mac — not the qwythos RDNA2 path — so this rebase does not
 claim a new tok/s number. The live brain keeps `build-hip/qwythos` until the
 side build `build-hip-0212/qwythos` is id-checked.
+0.2.12 → 0.2.16 (2026-11-19): upstream 0.2.13-0.2.16 is app/Terminal/Control
+work, the own-stack engine (llama.cpp's MMQ prompt kernels and ggml-base/cpu
+gone from the x86 CUDA/HIP builds), prompt-path work for gfx1151/780M, FP16
+prompt GEMMs and PcieAuto by default on gfx103x in Strata's own MoE engine (not
+the qwythos program), and the 0.2.16 layout move (the engine's CMake project is now
+`engine/`, so configure with `-S engine`). Rebased in two steps (v0.2.15, then
+the move to v0.2.16). Conflicts were CMake only: the top-level CMakeLists was
+split into `cmake/strata_gpu_engine.cmake`, so the qwythos/test_res/
+qwen35_gdn_multi targets and the HIP `mmvq_il_parity` hook moved there, and the
+`STRATA_HIP_GFX803` option sits next to upstream's options. The engine and
+kernel sources qwythos uses are byte-identical to the 0.2.12 port; of the
+shared headers, `iq_kernels.hpp` only adds declarations, `geometry.hpp` now
+takes `kCompiledGeometry` from a configure-time header (default `flash_next`,
+the same `ModelGeometry{}`), and `dp4a.hpp` changes a CUDA sm_60 branch only.
+So this rebase does not claim a new tok/s number. Side build: `build-hip-0216/qwythos`.
 `build-hip/test_res` = synthetic parity harness for the MMVQ
 residual-epilogue kernels (run on a sacrificial card, not your display GPU).
 

@@ -17,7 +17,7 @@ and two kernel patches inside a fork of [Niko1221/Strata](https://github.com/Nik
 Two ways to get the engine; pick one:
 
 - **Fork branch (recommended, current)**: `jollyroger1480/Strata`, branch
-  `port/qwythos-0.2.12` — upstream **v0.2.12** with the whole port as commits
+  `port/qwythos-0.2.16` — upstream **v0.2.16** with the whole port as commits
   (engine program, kernels, and the experimental `STRATA_HIP_GFX803` Polaris
   support). This is where development happens; 0004 below only applies here.
 - **Patch path (legacy base)**: the three `patches/*.patch` are cut against
@@ -91,8 +91,8 @@ You need: an AMD RDNA2 card (tested: RX 6950 XT, gfx1030; ROCm ≥ 6 with HIPCC)
 [empero-ai/Qwythos-9B-v2](https://huggingface.co/empero-ai/Qwythos-9B-v2) (Q6_K MTP).
 
 ```sh
-# Path A (recommended): the fork branch — v0.2.12 with everything as commits
-git clone -b port/qwythos-0.2.12 https://github.com/jollyroger1480/Strata
+# Path A (recommended): the fork branch — v0.2.16 with everything as commits
+git clone -b port/qwythos-0.2.16 https://github.com/jollyroger1480/Strata
 cd Strata
 # engine program + targets are already wired on the branch; build below
 
@@ -115,7 +115,9 @@ if(STRATA_ENABLE_HIP)
 endif()
 EOF
 
-cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release \
+# Path A: since upstream 0.2.16 the engine's CMake project is engine/ (-S engine);
+# Path B (v0.1.44.1) keeps it at the top level (-S .)
+cmake -S engine -B build-hip -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
   -DCMAKE_HIP_ARCHITECTURES=gfx1030 \
   -DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++ \
