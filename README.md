@@ -182,6 +182,39 @@ per slot, everything slower deleted:
 | **Office FAST** (:8183) | llama.cpp Vulkan | Qwythos-9B Q5_K_M | 4.3 tok/s | office quick chats |
 | **Office BIG** (:8184) | llama.cpp Vulkan | Qwen3-Next-80B IQ1_S | 7.8-9.1 tok/s | office heavy (was 1.49) |
 
+The decode column holds the earlier readings. The RAPIER ~94 tok/s was measured on empero-ai
+Qwythos-9B-v2 Q6_K with the engine CLI (400 greedy MTP tokens, 2026-10-15 build). It is still the
+right number for that model, but it was not taken on the Huihui model the brain runs now. The Cyber
+46-48 tok/s is from llama.cpp's own timings (2026-11-01). The office rows were not re-measured.
+The current readings for both home brains are below.
+
+#### Fresh readings, both home brains (2026-11-19)
+
+Both brains were measured the same way, through their HTTP API, on an RX 6950 XT (gfx1030, 16 GB) with nothing else on the GPU:
+
+- Prompt: a ~1,490-token prompt with `max_tokens` 1. A fresh nonce goes first in each run, so no prefix cache helps.
+- Generation: a short prompt with `max_tokens` 300 and temperature 0. Each run made 300 tokens. The prompt time, at the measured rate, is subtracted.
+- Each figure is the median of 3 runs. Token counts come from llama.cpp's `usage` for Cyber, and from re-tokenizing the reply with the model's `tokenizer.json` for Rapier.
+- Load is timed with the model evicted from the page cache.
+
+| | RAPIER (:8084) | RAPIER, previous engine | Cyber (:8085) |
+|---|---|---|---|
+| model | Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated Q6_K | same | Qwen3-14B-Uncensored Q5_K_M |
+| engine | Strata fork `port/qwythos-0.2.16` @ `79f278bb7` (HIP) | `port/qwythos-0.2.12` @ `30d363144` (HIP) | llama.cpp build 11515 @ `3d65c90d0` (Vulkan) |
+| context | 65,536 (caches preallocated) | 65,536 | 65,536 (YaRN x2, q4_0 KV) |
+| prompt tok/s (median of 3) | 275.5 | 263.8 | 628.5 |
+| generation tok/s (median of 3) | 76.5 | 74.4 | 44.3 (server's own timing: 45.4) |
+| VRAM in use while serving | 12.7 GB | 12.1 GB | 12.9 GB |
+| load, cold page cache | ~12.4 s (the HTTP server answers in 2 s; the engine loads on the first request: 17.8 s for that request vs 5.4 s warm) | ~12.3 s (18.0 s vs 5.7 s) | 47 s to `/health` 200 |
+| stop | under 1 s | under 1 s | 1 s |
+
+Notes on these readings:
+
+- The first Rapier generation after load ran at 39 tok/s on 0.2.16 (warm-up). The median leaves it out.
+- The HTTP generation figure is lower than the engine CLI figures above. It covers the whole server path, and it is a different model.
+- MTP draft acceptance on the Huihui model was not measured.
+- The two brains cannot run at the same time: together they need about 25 GB on a 16 GB card. The units conflict, so only one runs.
+
 Notes worth keeping:
 
 - **Cyber**: `scripts/serve_cyber.sh` — 9.79 GB on the 6950 XT, 64K window for Hermes
