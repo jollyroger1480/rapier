@@ -3,7 +3,8 @@
 <h1 align="center">⚔️ Rapier</h1>
 
 <p align="center"><b>Fast local decode for Qwen3.5-class hybrid models on AMD RDNA2 — with exact-verify MTP.</b><br>
-**94.1 tok/s greedy with exact-verify MTP** (400 tokens, Q6_K, RX 6950 XT, 2026-10-15 build), 66.3 tok/s without MTP — llama.cpp Vulkan does ~67 on the same card.<br>
+**94.1 tok/s greedy with exact-verify MTP** from the engine CLI (400 tokens, Qwythos-9B-v2 Q6_K, RX 6950 XT, 2026-10-15 build), 66.3 tok/s without MTP — llama.cpp Vulkan does ~67 on the same card.<br>
+Serving the current Huihui Qwythos-9B Q6_K over HTTP at 64K context: **76.5 tok/s** generation, 275.5 tok/s prompt (2026-11-19, engine 0.2.16).<br>
 Built at <a href="https://github.com/jollyroger1480">Buccaneer Salvage</a></p>
 
 ---
@@ -175,18 +176,18 @@ The engine's shapes are compile-time constants for Qwythos-9B, so sibling models
 llama.cpp on the same hardware. The rig runs exactly one brain per slot — the fastest
 per slot, everything slower deleted:
 
-| brain | engine | model | measured decode | slot |
+| brain | engine | model | measured decode (HTTP) | slot |
 |---|---|---|---|---|
-| **RAPIER** (:8084) | this repo (HIP, MTP) | Qwythos-9B heretic Q6_K | **~94 tok/s** | home fast / uncensored |
-| **Cyber** (:8085) | llama.cpp Vulkan | Qwen3-14B-Uncensored Q5_K_M | **46-48 tok/s** | home security + coding |
+| **RAPIER** (:8084) | this repo (HIP, MTP) | Huihui Qwythos-9B abliterated Q6_K | **76.5 tok/s** (2026-11-19) | home fast / uncensored |
+| **Cyber** (:8085) | llama.cpp Vulkan | Qwen3-14B-Uncensored Q5_K_M | **44.3 tok/s** (2026-11-19) | home security + coding |
 | **Office FAST** (:8183) | llama.cpp Vulkan | Qwythos-9B Q5_K_M | 4.3 tok/s | office quick chats |
 | **Office BIG** (:8184) | llama.cpp Vulkan | Qwen3-Next-80B IQ1_S | 7.8-9.1 tok/s | office heavy (was 1.49) |
 
-The decode column holds the earlier readings. The RAPIER ~94 tok/s was measured on empero-ai
-Qwythos-9B-v2 Q6_K with the engine CLI (400 greedy MTP tokens, 2026-10-15 build). It is still the
-right number for that model, but it was not taken on the Huihui model the brain runs now. The Cyber
-46-48 tok/s is from llama.cpp's own timings (2026-11-01). The office rows were not re-measured.
-The current readings for both home brains are below.
+The two home rows are the 2026-11-19 readings, taken through the HTTP API as described below.
+Earlier figures elsewhere in this README are kept as history: the ~94 tok/s was measured on empero-ai
+Qwythos-9B-v2 Q6_K with the engine CLI (400 greedy MTP tokens, 2026-10-15 build), not on the Huihui
+model the brain runs now, and the Cyber 46-48 tok/s came from llama.cpp's own timings (2026-11-01).
+The office rows were not re-measured.
 
 #### Fresh readings, both home brains (2026-11-19)
 
